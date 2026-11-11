@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import { randomBytes, randomUUID, createHash } from 'node:crypto'
-import express, { type NextFunction, type Request, type Response } from 'express'
+import express, { type NextFunction, type Request, type RequestHandler, type Response } from 'express'
 import cors from 'cors'
 import * as helmetModule from 'helmet'
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit'
@@ -44,7 +44,9 @@ const frontendUrls = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || '
 
 app.disable('x-powered-by')
 app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false)
-app.use(helmetModule.default())
+const helmetMiddleware = (helmetModule.default as unknown as
+  (options?: helmetModule.HelmetOptions) => RequestHandler)()
+app.use(helmetMiddleware)
 app.use(cors({
   origin(origin, callback) {
     if (!origin || frontendUrls.includes(origin)) return callback(null, true)
