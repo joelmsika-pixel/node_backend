@@ -3,9 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch src/local.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
+    "start": "node dist/local.js",
+    "db:init": "tsx src/init-db.ts",
     "create-admin": "tsx src/create-admin.ts",
     "test": "npm run build"
   },

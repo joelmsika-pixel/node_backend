@@ -6,7 +6,7 @@ import helmet from 'helmet'
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import bcrypt from 'bcryptjs'
 import nodemailer from 'nodemailer'
-import { row, rows, transaction, initializeDatabase, closeDatabase } from './db.js'
+import { row, rows, transaction } from './db.js'
 
 type User = {
   id: number
@@ -36,7 +36,6 @@ type ApiRequest = Request & { user?: User; membership?: Membership; business?: B
 type Handler = (req: ApiRequest, res: Response, next: NextFunction) => unknown
 
 const app = express()
-const port = Number(process.env.PORT || 4000)
 const accessMinutes = Number(process.env.ACCESS_TOKEN_EXPIRATION_MINUTES || 15)
 const refreshDays = Number(process.env.REFRESH_TOKEN_EXPIRATION_DAYS || 7)
 const currencies = new Set((process.env.BUSINESS_CURRENCIES || 'TZS,KES,UGX,USD').split(','))
@@ -1202,19 +1201,4 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   return fail(res, 500, 'An unexpected server error occurred.')
 })
 
-const server = app.listen(port, async () => {
-  try {
-    await initializeDatabase()
-    console.log(`Biashara Manager Node.js API listening on http://localhost:${port}`)
-  } catch (error) {
-    console.error('Database initialization failed:', error)
-    server.close(async () => { await closeDatabase(); process.exitCode = 1 })
-  }
-})
-
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => server.close(async () => {
-    await closeDatabase()
-    process.exit(0)
-  }))
-}
+export default app

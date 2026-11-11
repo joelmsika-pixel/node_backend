@@ -5,16 +5,26 @@ import { Pool } from 'pg'
 const { types } = pg
 types.setTypeParser(20, (value) => Number(value))
 
+const databaseUrl = process.env.DATABASE_URL
+if (process.env.VERCEL && !databaseUrl) {
+  throw new Error('DATABASE_URL must be configured for Vercel deployments.')
+}
+const ssl = process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined
+
 const pool = new Pool({
-  host: process.env.DB_HOST || '127.0.0.1',
-  port: Number(process.env.DB_PORT || 5432),
-  database: process.env.DB_DATABASE || 'biashara_manager',
-  user: process.env.DB_USERNAME || 'postgres',
-  password: process.env.DB_PASSWORD || '',
-  max: Number(process.env.DB_POOL_SIZE || 10),
+  ...(databaseUrl
+    ? { connectionString: databaseUrl }
+    : {
+        host: process.env.DB_HOST || '127.0.0.1',
+        port: Number(process.env.DB_PORT || 5432),
+        database: process.env.DB_DATABASE || 'biashara_manager',
+        user: process.env.DB_USERNAME || 'postgres',
+        password: process.env.DB_PASSWORD || '',
+      }),
+  ...(ssl ? { ssl } : {}),
+  max: Number(process.env.DB_POOL_SIZE || (process.env.VERCEL ? 3 : 10)),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
 })
 
 export async function rows<T extends QueryResultRow>(
