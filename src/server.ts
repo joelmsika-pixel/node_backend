@@ -2,8 +2,8 @@ import 'dotenv/config'
 import { randomBytes, randomUUID, createHash } from 'node:crypto'
 import express, { type NextFunction, type Request, type Response } from 'express'
 import cors from 'cors'
-import helmet from 'helmet'
-import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
+import { default as helmet } from 'helmet'
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit'
 import bcrypt from 'bcryptjs'
 import nodemailer from 'nodemailer'
 import { row, rows, transaction } from './db.js'
@@ -238,7 +238,7 @@ function activeBusinessUsers(business: Business): Promise<number[]> {
 
 const writeLimiter = rateLimit({
   windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false,
-  keyGenerator: (req) => `${ipKeyGenerator(req.ip || '127.0.0.1')}:${req.header('authorization') || 'guest'}`,
+  keyGenerator: (req: Request) => `${ipKeyGenerator(req.ip || '127.0.0.1')}:${req.header('authorization') || 'guest'}`,
 })
 
 const loginLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false })
