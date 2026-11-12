@@ -52,6 +52,7 @@ app.use(cors({
     if (!origin || frontendUrls.includes(origin)) return callback(null, true)
     return callback(Object.assign(new Error('Origin is not allowed by CORS.'), { status: 403 }))
   },
+  credentials: true,
   allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }))
