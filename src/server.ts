@@ -5,8 +5,21 @@ import cors from 'cors'
 import * as helmetModule from 'helmet'
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit'
 import bcrypt from 'bcryptjs'
+import multer from 'multer'
 import nodemailer from 'nodemailer'
 import { row, rows, transaction } from './db.js'
+import {
+  deleteProductImageObject,
+  isProductImageStorageConfigured,
+  MAX_PRODUCT_IMAGES,
+  MAX_PRODUCT_UPLOAD_BYTES,
+  MAX_RASTER_UPLOAD_BYTES,
+  optimizeProductImage,
+  ProductImageError,
+  productImageKeys,
+  productImageUrl,
+  uploadProductImageObject,
+} from './product-images.js'
 
 type User = {
   id: number
@@ -547,38 +560,459 @@ async function paginated<T extends import('../node_modules/@types/pg/index.js').
   res.json({ data, meta: { current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total }, current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total })
 }
 
+type ProductValues = {
+  name: string
+  description: string
+  selling_price: string
+  cost_price: string | null
+  sku: string | null
+  category: string
+  stock_quantity: string
+}
+
+type ProductRow = ProductValues & {
+  id: number
+  business_id: number
+  created_by: number | null
+  updated_by: number | null
+  deleted_at: Date | null
+  created_at: Date
+  updated_at: Date
+}
+
+type ProductImageRow = {
+  id: number
+  business_id: number
+  product_id: number
+  image_key: string
+  thumbnail_key: string
+  width: number
+  height: number
+  size_bytes: number
+  thumbnail_size_bytes: number
+  sort_order: number
+  deleted_at: Date | null
+}
+
+const productImageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: MAX_PRODUCT_IMAGES,
+    fileSize: MAX_RASTER_UPLOAD_BYTES,
+    fields: 12,
+    fieldSize: 64 * 1024,
+  },
+}).array('images', MAX_PRODUCT_IMAGES)
+
+const parseProductImages: Handler = (req, res, next) => {
+  productImageUpload(req, res, (error) => {
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') return fail(res, 413, 'Each raster image must not exceed 8 MiB.')
+      if (error.code === 'LIMIT_FILE_COUNT') return fail(res, 413, 'A product can have at most 5 images.')
+      return fail(res, 422, 'The product image upload could not be read.')
+    }
+    if (error) return fail(res, 400, 'The product image upload could not be read.')
+    const files = Array.isArray(req.files) ? req.files : []
+    const totalBytes = files.reduce((total, file) => total + file.size, 0)
+    if (totalBytes > MAX_PRODUCT_UPLOAD_BYTES) return fail(res, 413, 'The combined product image upload must not exceed 40 MiB.')
+    return next()
+  })
+}
+
+function productValues(body: Record<string, unknown>, res: Response): ProductValues | null {
+  if (!validate(res, body, {
+    name: { required: true, max: 150 },
+    description: { max: 2000 },
+    selling_price: { required: true },
+    cost_price: {},
+    sku: { max: 100 },
+    category: { required: true, max: 100 },
+    stock_quantity: { required: true },
+  })) return null
+
+  const numericText = (value: unknown) => (
+    typeof value === 'number' && Number.isFinite(value) ? String(value) : text(value)
+  )
+  const sellingPrice = numericText(body.selling_price)
+  const costPrice = numericText(body.cost_price)
+  const stockQuantity = numericText(body.stock_quantity)
+  if (!/^\d{1,10}(\.\d{1,2})?$/.test(sellingPrice)) return fail(res, 422, 'Selling price must be a non-negative amount with up to 2 decimal places.'), null
+  if (costPrice && !/^\d{1,10}(\.\d{1,2})?$/.test(costPrice)) return fail(res, 422, 'Cost price must be a non-negative amount with up to 2 decimal places.'), null
+  if (!/^\d{1,9}(\.\d{1,3})?$/.test(stockQuantity)) return fail(res, 422, 'Stock quantity must be non-negative with up to 3 decimal places.'), null
+
+  return {
+    name: text(body.name),
+    description: text(body.description),
+    selling_price: sellingPrice,
+    cost_price: costPrice || null,
+    sku: text(body.sku) || null,
+    category: text(body.category),
+    stock_quantity: stockQuantity,
+  }
+}
+
+function requestedImageIds(value: unknown, res: Response): number[] | undefined | null {
+  if (value === undefined) return undefined
+  let ids: unknown
+  if (typeof value === 'string') {
+    try {
+      ids = JSON.parse(value)
+    } catch {
+      fail(res, 422, 'The retained image list is invalid.')
+      return null
+    }
+  } else {
+    ids = value
+  }
+  if (!Array.isArray(ids) || !ids.every((id) => Number.isSafeInteger(Number(id)) && Number(id) > 0)) {
+    fail(res, 422, 'The retained image list is invalid.')
+    return null
+  }
+  return [...new Set(ids.map(Number))]
+}
+
+function uploadedProductFiles(req: Request): Express.Multer.File[] {
+  return Array.isArray(req.files) ? req.files : []
+}
+
+async function optimizeUploadedProductImages(files: Express.Multer.File[]) {
+  const images = []
+  for (const file of files) images.push(await optimizeProductImage(file.buffer, file.mimetype))
+  return images
+}
+
+async function trackProductImageCleanup(businessId: number, objectKeys: string[]): Promise<void> {
+  if (!objectKeys.length) return
+  await rows(
+    `INSERT INTO product_image_cleanup(object_key,business_id)
+     SELECT pending.object_key,$1 FROM unnest($2::text[]) AS pending(object_key)
+     ON CONFLICT (object_key) DO NOTHING`,
+    [businessId, objectKeys],
+  )
+}
+
+async function cleanupUploadedProductImages(businessId: number, objectKeys: string[]): Promise<void> {
+  if (!objectKeys.length || !isProductImageStorageConfigured()) return
+  const failedKeys: string[] = []
+  for (const objectKey of objectKeys) {
+    try {
+      await deleteProductImageObject(objectKey)
+    } catch (error) {
+      failedKeys.push(objectKey)
+      console.error(`Unable to roll back product image object for business ${businessId}:`, error)
+    }
+  }
+  if (failedKeys.length) {
+    try {
+      await trackProductImageCleanup(businessId, failedKeys)
+    } catch (error) {
+      console.error(`Unable to queue product image cleanup for business ${businessId}:`, error)
+    }
+  }
+}
+
+async function retryPendingProductImageCleanup(businessId: number): Promise<number> {
+  const deletedImages = await rows<ProductImageRow>(
+    `SELECT * FROM product_images
+     WHERE business_id=$1 AND deleted_at IS NOT NULL ORDER BY id LIMIT 20`,
+    [businessId],
+  )
+
+  if (isProductImageStorageConfigured()) {
+    for (const image of deletedImages) {
+      try {
+        await deleteProductImageObject(image.image_key)
+        await deleteProductImageObject(image.thumbnail_key)
+        await rows('DELETE FROM product_images WHERE id=$1 AND business_id=$2 AND deleted_at IS NOT NULL', [image.id, businessId])
+      } catch (error) {
+        console.error(`Product image cleanup is pending for business ${businessId}, image ${image.id}:`, error)
+      }
+    }
+
+    const orphanedObjects = await rows<{ object_key: string }>(
+      'SELECT object_key FROM product_image_cleanup WHERE business_id=$1 ORDER BY created_at LIMIT 20',
+      [businessId],
+    )
+    for (const object of orphanedObjects) {
+      try {
+        await deleteProductImageObject(object.object_key)
+        await rows('DELETE FROM product_image_cleanup WHERE business_id=$1 AND object_key=$2', [businessId, object.object_key])
+      } catch (error) {
+        console.error(`Orphaned product image cleanup is pending for business ${businessId}:`, error)
+      }
+    }
+  }
+
+  const pending = await row<{ count: number }>(
+    `SELECT (
+       (SELECT count(*) FROM product_images WHERE business_id=$1 AND deleted_at IS NOT NULL)
+       + (SELECT count(*) FROM product_image_cleanup WHERE business_id=$1)
+     )::int AS count`,
+    [businessId],
+  )
+  return pending?.count || 0
+}
+
+async function productImagesFor(businessId: number, productIds: number[]): Promise<Map<number, Record<string, unknown>[]>> {
+  const grouped = new Map<number, Record<string, unknown>[]>()
+  if (!productIds.length) return grouped
+
+  const images = await rows<ProductImageRow>(
+    `SELECT * FROM product_images
+     WHERE business_id=$1 AND product_id=ANY($2::bigint[]) AND deleted_at IS NULL
+     ORDER BY product_id,sort_order,id`,
+    [businessId, productIds],
+  )
+  for (const image of images) {
+    const list = grouped.get(image.product_id) || []
+    list.push({
+      id: image.id,
+      url: productImageUrl(image.image_key),
+      thumbnail_url: productImageUrl(image.thumbnail_key),
+      width: image.width,
+      height: image.height,
+      size_bytes: image.size_bytes,
+      sort_order: image.sort_order,
+    })
+    grouped.set(image.product_id, list)
+  }
+  return grouped
+}
+
+function productFields(body: ProductValues): unknown[] {
+  return [body.name, body.description, body.selling_price, body.cost_price, body.sku, body.category, body.stock_quantity]
+}
+
+business.get('/products', permission('products.view'), asyncRoute(async (req, res) => {
+  const businessId = req.business!.id
+  await retryPendingProductImageCleanup(businessId)
+  const { page, perPage, offset } = pageOptions(req)
+  const search = text(req.query.search)
+  const category = text(req.query.category)
+  const stockStatus = text(req.query.stock_status) || 'all'
+  if (!['all', 'in-stock', 'out-of-stock'].includes(stockStatus)) return fail(res, 422, 'The selected stock filter is invalid.')
+
+  const filter = `p.business_id=$1 AND p.deleted_at IS NULL
+    AND ($2='' OR p.name ILIKE '%'||$2||'%' OR p.description ILIKE '%'||$2||'%' OR COALESCE(p.sku,'') ILIKE '%'||$2||'%' OR p.category ILIKE '%'||$2||'%')
+    AND ($3='' OR p.category=$3)
+    AND ($4='all' OR ($4='in-stock' AND p.stock_quantity>0) OR ($4='out-of-stock' AND p.stock_quantity=0))`
+  const products = await rows<ProductRow>(
+    `SELECT p.* FROM products p WHERE ${filter} ORDER BY p.name,p.id LIMIT $5 OFFSET $6`,
+    [businessId, search, category, stockStatus, perPage, offset],
+  )
+  const total = (await row<{ count: number }>(
+    `SELECT count(*)::int AS count FROM products p WHERE ${filter}`,
+    [businessId, search, category, stockStatus],
+  ))?.count || 0
+  const categories = await rows<{ category: string }>(
+    'SELECT DISTINCT category FROM products WHERE business_id=$1 AND deleted_at IS NULL ORDER BY category',
+    [businessId],
+  )
+  const images = await productImagesFor(businessId, products.map((product) => product.id))
+  const data = products.map((product) => ({ ...product, images: images.get(product.id) || [] }))
+  const meta = { current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total }
+  return res.json({ data, categories: categories.map((item) => item.category), meta, ...meta })
+}))
+
+business.post('/products', permission('products.create'), writeLimiter, parseProductImages, asyncRoute(async (req, res) => {
+  const input = productValues(req.body as Record<string, unknown>, res)
+  if (!input) return
+  const files = uploadedProductFiles(req)
+  const optimizedImages = await optimizeUploadedProductImages(files)
+  if (optimizedImages.length && !isProductImageStorageConfigured()) return fail(res, 503, 'Product image storage is not configured.')
+
+  const uploadedKeys: string[] = []
+  let product: ProductRow
+  try {
+    product = await transaction(async (client) => {
+      const saved = await row<ProductRow>(
+        `INSERT INTO products(business_id,name,description,selling_price,cost_price,sku,category,stock_quantity,created_by,updated_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *`,
+        [req.business!.id, ...productFields(input), req.user!.id],
+        client,
+      )
+      if (!saved) throw new Error('Product insert did not return a row.')
+
+      for (const [index, image] of optimizedImages.entries()) {
+        const keys = productImageKeys(req.business!.id, saved.id)
+        uploadedKeys.push(keys.imageKey, keys.thumbnailKey)
+        await uploadProductImageObject(keys.imageKey, image.image)
+        await uploadProductImageObject(keys.thumbnailKey, image.thumbnail)
+        await client.query(
+          `INSERT INTO product_images(business_id,product_id,image_key,thumbnail_key,width,height,size_bytes,thumbnail_size_bytes,sort_order)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [req.business!.id, saved.id, keys.imageKey, keys.thumbnailKey, image.width, image.height, image.image.length, image.thumbnail.length, index],
+        )
+      }
+      await audit(req.business!.id, req.user!.id, 'product.created', 'Product', saved.id, null, { ...input, image_count: optimizedImages.length }, client)
+      return saved
+    })
+  } catch (error) {
+    await cleanupUploadedProductImages(req.business!.id, uploadedKeys)
+    const failure = error as Error & { code?: string; constraint?: string }
+    if (failure.code === '23505' && failure.constraint === 'products_business_sku_unique_idx') {
+      return fail(res, 409, 'A product with this SKU already exists in this business.')
+    }
+    throw error
+  }
+
+  const images = await productImagesFor(req.business!.id, [product.id])
+  return res.status(201).json({ data: { ...product, images: images.get(product.id) || [] } })
+}))
+
+business.patch('/products/:product', permission('products.edit'), writeLimiter, parseProductImages, asyncRoute(async (req, res) => {
+  const input = productValues(req.body as Record<string, unknown>, res)
+  if (!input) return
+  const productId = Number(req.params.product)
+  if (!Number.isSafeInteger(productId) || productId <= 0) return fail(res, 404, 'Product not found.')
+  const keepIds = requestedImageIds(req.body.keep_image_ids, res)
+  if (keepIds === null) return
+  const optimizedImages = await optimizeUploadedProductImages(uploadedProductFiles(req))
+  if (optimizedImages.length && !isProductImageStorageConfigured()) return fail(res, 503, 'Product image storage is not configured.')
+
+  const uploadedKeys: string[] = []
+  let product: ProductRow
+  try {
+    product = await transaction(async (client) => {
+      const current = await row<ProductRow>(
+        'SELECT * FROM products WHERE id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
+        [productId, req.business!.id],
+        client,
+      )
+      if (!current) throw Object.assign(new Error('Product not found.'), { status: 404 })
+
+      const currentImages = await rows<ProductImageRow>(
+        'SELECT * FROM product_images WHERE product_id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
+        [productId, req.business!.id],
+        client,
+      )
+      const retainedIds = keepIds || currentImages.map((image) => image.id)
+      const currentIds = new Set(currentImages.map((image) => image.id))
+      if (retainedIds.some((id) => !currentIds.has(id))) {
+        throw new ProductImageError('One or more selected images do not belong to this product.')
+      }
+      if (retainedIds.length + optimizedImages.length > MAX_PRODUCT_IMAGES) {
+        throw new ProductImageError('A product can have at most 5 images.')
+      }
+
+      const updated = await row<ProductRow>(
+        `UPDATE products SET name=$1,description=$2,selling_price=$3,cost_price=$4,sku=$5,category=$6,stock_quantity=$7,
+         updated_by=$8,updated_at=CURRENT_TIMESTAMP
+         WHERE id=$9 AND business_id=$10 AND deleted_at IS NULL RETURNING *`,
+        [...productFields(input), req.user!.id, productId, req.business!.id],
+        client,
+      )
+      if (!updated) throw Object.assign(new Error('Product not found.'), { status: 404 })
+
+      const removedImages = await rows<ProductImageRow>(
+        `UPDATE product_images SET deleted_at=CURRENT_TIMESTAMP
+         WHERE product_id=$1 AND business_id=$2 AND deleted_at IS NULL AND NOT(id=ANY($3::bigint[]))
+         RETURNING *`,
+        [productId, req.business!.id, retainedIds],
+        client,
+      )
+      for (const [index, image] of optimizedImages.entries()) {
+        const keys = productImageKeys(req.business!.id, productId)
+        uploadedKeys.push(keys.imageKey, keys.thumbnailKey)
+        await uploadProductImageObject(keys.imageKey, image.image)
+        await uploadProductImageObject(keys.thumbnailKey, image.thumbnail)
+        await client.query(
+          `INSERT INTO product_images(business_id,product_id,image_key,thumbnail_key,width,height,size_bytes,thumbnail_size_bytes,sort_order)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [req.business!.id, productId, keys.imageKey, keys.thumbnailKey, image.width, image.height, image.image.length, image.thumbnail.length, retainedIds.length + index],
+        )
+      }
+      await audit(req.business!.id, req.user!.id, 'product.updated', 'Product', productId, { ...current, removed_image_count: removedImages.length }, { ...input, added_image_count: optimizedImages.length }, client)
+      return updated
+    })
+  } catch (error) {
+    await cleanupUploadedProductImages(req.business!.id, uploadedKeys)
+    const failure = error as Error & { code?: string; constraint?: string }
+    if (failure.code === '23505' && failure.constraint === 'products_business_sku_unique_idx') {
+      return fail(res, 409, 'A product with this SKU already exists in this business.')
+    }
+    throw error
+  }
+
+  await retryPendingProductImageCleanup(req.business!.id)
+  const images = await productImagesFor(req.business!.id, [product.id])
+  const cleanupPending = await row<{ count: number }>(
+    'SELECT count(*)::int AS count FROM product_images WHERE business_id=$1 AND product_id=$2 AND deleted_at IS NOT NULL',
+    [req.business!.id, product.id],
+  )
+  return res.json({
+    data: { ...product, images: images.get(product.id) || [] },
+    cleanup_pending: Boolean(cleanupPending?.count),
+  })
+}))
+
+business.delete('/products/:product', permission('products.delete'), writeLimiter, asyncRoute(async (req, res) => {
+  const productId = Number(req.params.product)
+  if (!Number.isSafeInteger(productId) || productId <= 0) return fail(res, 404, 'Product not found.')
+  await transaction(async (client) => {
+    const product = await row<ProductRow>(
+      'SELECT * FROM products WHERE id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
+      [productId, req.business!.id],
+      client,
+    )
+    if (!product) throw Object.assign(new Error('Product not found.'), { status: 404 })
+    const images = await rows<ProductImageRow>(
+      'UPDATE product_images SET deleted_at=CURRENT_TIMESTAMP WHERE product_id=$1 AND business_id=$2 AND deleted_at IS NULL RETURNING *',
+      [productId, req.business!.id],
+      client,
+    )
+    await client.query(
+      'UPDATE products SET deleted_at=CURRENT_TIMESTAMP,updated_by=$1,updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND business_id=$3',
+      [req.user!.id, productId, req.business!.id],
+    )
+    await audit(req.business!.id, req.user!.id, 'product.deleted', 'Product', productId, { ...product, image_count: images.length }, null, client)
+  })
+  await retryPendingProductImageCleanup(req.business!.id)
+  const pending = await row<{ count: number }>(
+    'SELECT count(*)::int AS count FROM product_images WHERE business_id=$1 AND product_id=$2 AND deleted_at IS NOT NULL',
+    [req.business!.id, productId],
+  )
+  return res.json({
+    message: 'Product deleted.',
+    cleanup_pending: Boolean(pending?.count),
+    ...(pending?.count ? { warning: 'The product was deleted, but some stored images are queued for cleanup.' } : {}),
+  })
+}))
+
 business.get('/dashboard', permission('dashboard.view'), asyncRoute(async (req, res) => {
   const id = req.business!.id
   const from = text(req.query.from) || '0001-01-01'
   const to = text(req.query.to) || '9999-12-31'
-  const totals = await row<Record<string, string>>(
-    `SELECT
+  const [totals, balances, recent] = await Promise.all([
+    row<Record<string, string>>(
+      `SELECT
       COALESCE((SELECT sum(total_amount) FROM sales WHERE business_id=$1 AND voided_at IS NULL AND sale_date BETWEEN $2 AND $3),0)::text AS sales_total,
       COALESCE((SELECT sum(amount) FROM income_records WHERE business_id=$1 AND voided_at IS NULL AND income_date BETWEEN $2 AND $3),0)::text AS income_total,
       COALESCE((SELECT sum(amount) FROM expenses WHERE business_id=$1 AND voided_at IS NULL AND expense_date BETWEEN $2 AND $3),0)::text AS expenses_total,
       COALESCE((SELECT sum(amount) FROM sale_payments WHERE business_id=$1 AND voided_at IS NULL AND payment_date BETWEEN $2 AND $3),0)::text AS payments_total,
       ((SELECT count(*) FROM sales WHERE business_id=$1 AND voided_at IS NULL AND status <> 'paid')+
        (SELECT count(*) FROM business_loans l WHERE l.business_id=$1 AND l.principal>
-         COALESCE((SELECT sum(r.amount) FROM business_loan_repayments r WHERE r.business_loan_id=l.id),0)))::text AS debt_count`,
-    [id, from, to],
-  )
-  const balances = await row<{ sales_balance: string; loan_balance: string }>(
-    `SELECT
+         COALESCE((SELECT sum(r.amount) FROM business_loan_repayments r WHERE r.business_id=$1 AND r.business_loan_id=l.id),0)))::text AS debt_count`,
+      [id, from, to],
+    ),
+    row<{ sales_balance: string; loan_balance: string }>(
+      `SELECT
       COALESCE((SELECT sum(s.total_amount-COALESCE(p.paid,0)) FROM sales s
-        LEFT JOIN (SELECT sale_id,sum(amount) AS paid FROM sale_payments WHERE voided_at IS NULL GROUP BY sale_id) p ON p.sale_id=s.id
+        LEFT JOIN (SELECT sale_id,sum(amount) AS paid FROM sale_payments WHERE business_id=$1 AND voided_at IS NULL GROUP BY sale_id) p ON p.sale_id=s.id
         WHERE s.business_id=$1 AND s.voided_at IS NULL AND s.sale_date BETWEEN $2 AND $3 AND s.total_amount>COALESCE(p.paid,0)),0)::text AS sales_balance,
       COALESCE((SELECT sum(l.principal-COALESCE(r.paid,0)) FROM business_loans l
-        LEFT JOIN (SELECT business_loan_id,sum(amount) AS paid FROM business_loan_repayments GROUP BY business_loan_id) r ON r.business_loan_id=l.id
+        LEFT JOIN (SELECT business_loan_id,sum(amount) AS paid FROM business_loan_repayments WHERE business_id=$1 GROUP BY business_loan_id) r ON r.business_loan_id=l.id
         WHERE l.business_id=$1 AND l.loan_date BETWEEN $2 AND $3 AND l.principal>COALESCE(r.paid,0)),0)::text AS loan_balance`,
-    [id, from, to],
-  )
-  const recent = await rows(
-    `SELECT s.*, c.name AS customer_name,
+      [id, from, to],
+    ),
+    rows(
+      `SELECT s.*, c.name AS customer_name,
        COALESCE((SELECT json_agg(i) FROM sale_items i WHERE i.sale_id=s.id),'[]'::json) AS items
      FROM sales s LEFT JOIN customers c ON c.id=s.customer_id
      WHERE s.business_id=$1 AND s.voided_at IS NULL ORDER BY s.sale_date DESC,s.id DESC LIMIT 8`,
-    [id],
-  )
+      [id],
+    ),
+  ])
   return res.json({
     sales_total: totals?.sales_total || '0.00', income_total: totals?.income_total || '0.00',
     expenses_total: totals?.expenses_total || '0.00', payments_total: totals?.payments_total || '0.00',
@@ -837,7 +1271,7 @@ business.post('/employees', permission('employees.manage'), writeLimiter, asyncR
   const body = req.body as Record<string, unknown>
   if (!validate(res, body, { name: { required: true, max: 150 }, email: { required: true, max: 150, email: true }, phone: { max: 30 } })) return
   const email = text(body.email).toLowerCase()
-  const permissions = ['sales.view', 'sales.create', 'payments.view', 'payments.create', 'income.view', 'income.create', 'expenses.view', 'expenses.create', 'debts.view', 'debts.create']
+  const permissions = ['sales.view', 'sales.create', 'payments.view', 'payments.create', 'income.view', 'income.create', 'expenses.view', 'expenses.create', 'debts.view', 'debts.create', 'products.view', 'products.create', 'products.edit', 'products.delete']
   const employee = await transaction(async (client) => {
     const removed = await row('SELECT id FROM users WHERE lower(removed_email)=$1 AND is_active=false', [email], client)
     if (removed) throw Object.assign(new Error('This employee was removed. Restore the existing employee profile instead of adding a new account.'), { status: 422 })

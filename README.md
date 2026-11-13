@@ -36,6 +36,63 @@ it on startup. It does not create the rest of the application schema. The
 preserved `data/legacy.sqlite` file is an archive only; the API does not read
 it.
 
+## Products and Cloudflare R2 images
+
+Product routes are scoped to `/api/businesses/{business}/products`. The API
+checks the existing `products.view`, `products.create`, `products.edit`, and
+`products.delete` membership permissions on every request. Owners are
+authorized by the existing owner rule. The product migration adds these four
+permissions to current employee memberships; newly created employees receive
+them by default.
+
+After confirming that the target PostgreSQL database has the existing
+`businesses`, `users`, and `business_user` tables, take a backup and run the
+product migration explicitly from this directory:
+
+```sh
+npm run db:migrate-products
+```
+
+This creates the product, product-image, and image-cleanup tables. Like
+`db:init`, it is not run at API startup or during deployment. Do not run it
+against production until the database target and backup have been verified.
+
+Configure these backend environment variables before uploading images:
+
+- `R2_ACCOUNT_ID`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+- `R2_BUCKET_NAME=biashara-manager-products`
+- `R2_PUBLIC_URL` — the public bucket custom-domain/base URL used to serve
+  product images (without a trailing slash).
+- `R2_ENDPOINT` — the Cloudflare R2 S3 API endpoint, normally
+  `https://<account-id>.r2.cloudflarestorage.com`. If omitted, the API derives
+  it from `R2_ACCOUNT_ID`.
+
+Create a Cloudflare R2 bucket and a public custom domain (or other approved
+public-read configuration) for `R2_PUBLIC_URL`. Use a least-privilege R2 token
+for that bucket. Keep the access key and secret only in the backend's
+environment; never add them to frontend variables or source control. Restart
+the API after configuring its environment.
+
+Uploads accept up to 5 JPG/JPEG, PNG, WebP, or SVG images per product. Each
+raster image may be up to 8 MiB; each SVG may be up to 2 MiB; the combined
+source upload may be up to 40 MiB. Source images are limited to 8,000 pixels
+per side and 40 megapixels. The backend validates and rasterizes SVG, strips
+metadata by re-encoding, converts images to WebP, resizes main images to at
+most 1,200 × 1,200 pixels, and creates 320-pixel thumbnails. It reduces
+quality/dimensions as needed to cap each main WebP at 200,000 bytes; very
+complex images that cannot meet that cap are rejected with an actionable
+error. Stored object keys are namespaced by business and product. Replaced
+images and deleted products are cleaned from R2; failed cleanup is retained
+for retry and reported to the client.
+
+The frontend displays client-side previews and upload progress, but validation
+and authorization are enforced again on the backend. Run `npm test` in this
+directory to build the API and test image-format validation, SVG safety,
+dimension limits, WebP conversion, and thumbnail generation. Live database
+and R2 checks require the deployment's own configured infrastructure.
+
 Existing administrator accounts can sign in with their current password. To
 create the first administrator on a new installation, run `npm run
 create-admin` from this directory. The password prompt is hidden; use a
@@ -110,8 +167,8 @@ password reset only after SMTP is configured.
 - `POST /api/forgot-password`, `POST /api/reset-password`
 - `/api/admin/businesses` — Platform Admin only
 - `/api/businesses/{business}` and its dashboard, reports, activity, debts,
-  employees, inbox, customers, categories, payment methods, sales, payments,
-  income, expenses, and loan routes
+  employees, inbox, customers, categories, payment methods, products and
+  product-image uploads, sales, payments, income, expenses, and loan routes
 
 Business routes check active membership and permissions on the server. Tenant
 records are scoped to the requested business. Write requests retain audit

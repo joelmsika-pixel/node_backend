@@ -7,22 +7,27 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/local.js",
     "db:init": "tsx src/init-db.ts",
+    "db:migrate-products": "tsx src/products-migration.ts",
     "create-admin": "tsx src/create-admin.ts",
-    "test": "npm run build"
+    "test": "npm run build && tsx --test src/product-images.test.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1168.0",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
     "helmet": "^8.1.0",
+    "multer": "^2.5.0",
     "nodemailer": "^10.5.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "sharp": "^0.35.5"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
+    "@types/multer": "^2.3.0",
     "@types/node": "^26.0.0",
     "@types/nodemailer": "^6.4.17",
     "@types/pg": "^8.15.5",
