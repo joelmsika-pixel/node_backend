@@ -1,6 +1,7 @@
 import { DeleteObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 import { randomUUID } from 'node:crypto'
 import sharp, { type Metadata } from 'sharp'
+import { logError } from './safe-logger.js'
 
 export const MAX_PRODUCT_IMAGES = 5
 export const MAX_RASTER_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -114,7 +115,7 @@ export async function uploadProductImageObject(objectKey: string, body: Buffer):
       CacheControl: 'public, max-age=31536000, immutable',
     }))
   } catch (error) {
-    console.error('Cloudflare R2 product image upload failed:', error)
+    logError('r2.product_image.upload', error)
     throw new ProductImageError('Product image storage is unavailable. Try again later.', 502)
   }
 }
@@ -124,7 +125,7 @@ export async function deleteProductImageObject(objectKey: string): Promise<void>
   try {
     await client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: objectKey }))
   } catch (error) {
-    console.error('Cloudflare R2 product image deletion failed:', error)
+    logError('r2.product_image.delete', error)
     throw new ProductImageError('A product image could not be removed from storage.', 502)
   }
 }

@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import { normalizeDatabaseUrl } from './db-config.js'
 import pg, { type PoolClient, type QueryResultRow } from 'pg'
 import { Pool } from 'pg'
 
@@ -6,14 +7,19 @@ const { types } = pg
 types.setTypeParser(20, (value) => Number(value))
 
 const databaseUrl = process.env.DATABASE_URL
-if (process.env.VERCEL && !databaseUrl) {
+const isVercel = Boolean(process.env.VERCEL)
+const requireSsl = process.env.DB_SSL === 'true'
+if (isVercel && !databaseUrl) {
   throw new Error('DATABASE_URL must be configured for Vercel deployments.')
 }
-const ssl = process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined
+const connectionString = databaseUrl
+  ? normalizeDatabaseUrl(databaseUrl, { vercel: isVercel, requireSsl })
+  : undefined
+const ssl = !connectionString && requireSsl ? { rejectUnauthorized: true } : undefined
 
 const pool = new Pool({
-  ...(databaseUrl
-    ? { connectionString: databaseUrl }
+  ...(connectionString
+    ? { connectionString }
     : {
         host: process.env.DB_HOST || '127.0.0.1',
         port: Number(process.env.DB_PORT || 5432),

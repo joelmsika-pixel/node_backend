@@ -8,6 +8,7 @@ import bcrypt from 'bcryptjs'
 import multer from 'multer'
 import nodemailer from 'nodemailer'
 import { row, rows, transaction } from './db.js'
+import { logError } from './safe-logger.js'
 import {
   deleteProductImageObject,
   isProductImageStorageConfigured,
@@ -56,7 +57,8 @@ const frontendUrls = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || '
   .split(',').map((url) => url.trim()).filter(Boolean)
 
 app.disable('x-powered-by')
-app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false)
+const isVercel = Boolean(process.env.VERCEL)
+app.set('trust proxy', isVercel ? 1 : process.env.TRUST_PROXY === 'true' ? 1 : false)
 const helmetMiddleware = (helmetModule.default as unknown as
   (options?: helmetModule.HelmetOptions) => RequestHandler)()
 app.use(helmetMiddleware)
@@ -87,11 +89,17 @@ app.get('/api/health', asyncRoute(async (_req, res) => {
   await row('SELECT 1')
   res.json({ status: 'ok', database: 'connected' })
 }))
+
+function clientIpKey(req: Request): string {
+  return ipKeyGenerator(req.ip || req.socket.remoteAddress || '127.0.0.1')
+}
+
 app.use('/api', rateLimit({
   windowMs: 60_000,
   limit: 120,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: clientIpKey,
 }))
 
 function hash(value: string): string {
@@ -254,11 +262,11 @@ function activeBusinessUsers(business: Business): Promise<number[]> {
 
 const writeLimiter = rateLimit({
   windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false,
-  keyGenerator: (req: Request) => `${ipKeyGenerator(req.ip || '127.0.0.1')}:${req.header('authorization') || 'guest'}`,
+  keyGenerator: clientIpKey,
 })
 
-const loginLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false })
-const refreshLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false })
+const loginLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey })
+const refreshLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey })
 const loginFailures = new Map<string, { count: number; lockedUntil: number }>()
 
 app.post('/api/login', loginLimiter, asyncRoute(async (req, res) => {
@@ -328,7 +336,7 @@ app.post('/api/token/refresh', refreshLimiter, asyncRoute(async (req, res) => {
   return res.json(await issuePair(result.user, result.name))
 }))
 
-app.post('/api/forgot-password', rateLimit({ windowMs: 3_600_000, limit: 3, standardHeaders: true, legacyHeaders: false }), asyncRoute(async (req, res) => {
+app.post('/api/forgot-password', rateLimit({ windowMs: 3_600_000, limit: 3, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey }), asyncRoute(async (req, res) => {
   const email = text(req.body?.email).toLowerCase()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 150) return fail(res, 422, 'The email must be a valid email address.')
   const smtpHost = process.env.SMTP_HOST || process.env.MAIL_HOST
@@ -366,7 +374,7 @@ app.post('/api/forgot-password', rateLimit({ windowMs: 3_600_000, limit: 3, stan
   return res.json({ message: 'If the account exists, a password reset link has been sent.' })
 }))
 
-app.post('/api/reset-password', rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false }), asyncRoute(async (req, res) => {
+app.post('/api/reset-password', rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey }), asyncRoute(async (req, res) => {
   const { token, email, password, password_confirmation: confirmation } = req.body as Record<string, unknown>
   if (!validate(res, { token, email, password }, {
     token: { required: true }, email: { required: true, max: 150, email: true }, password: { required: true, min: 12 },
@@ -699,24 +707,30 @@ async function cleanupUploadedProductImages(businessId: number, objectKeys: stri
       await deleteProductImageObject(objectKey)
     } catch (error) {
       failedKeys.push(objectKey)
-      console.error(`Unable to roll back product image object for business ${businessId}:`, error)
+      logError('products.image.rollback', error)
     }
   }
   if (failedKeys.length) {
     try {
       await trackProductImageCleanup(businessId, failedKeys)
     } catch (error) {
-      console.error(`Unable to queue product image cleanup for business ${businessId}:`, error)
+      logError('products.image.cleanup_queue', error)
     }
   }
 }
 
 async function retryPendingProductImageCleanup(businessId: number): Promise<number> {
-  const deletedImages = await rows<ProductImageRow>(
-    `SELECT * FROM product_images
-     WHERE business_id=$1 AND deleted_at IS NOT NULL ORDER BY id LIMIT 20`,
-    [businessId],
-  )
+  let deletedImages: ProductImageRow[]
+  try {
+    deletedImages = await rows<ProductImageRow>(
+      `SELECT * FROM product_images
+       WHERE business_id=$1 AND deleted_at IS NOT NULL ORDER BY id LIMIT 20`,
+      [businessId],
+    )
+  } catch (error) {
+    logError('products.image.cleanup_list', error)
+    return 0
+  }
 
   if (isProductImageStorageConfigured()) {
     for (const image of deletedImages) {
@@ -725,32 +739,43 @@ async function retryPendingProductImageCleanup(businessId: number): Promise<numb
         await deleteProductImageObject(image.thumbnail_key)
         await rows('DELETE FROM product_images WHERE id=$1 AND business_id=$2 AND deleted_at IS NOT NULL', [image.id, businessId])
       } catch (error) {
-        console.error(`Product image cleanup is pending for business ${businessId}, image ${image.id}:`, error)
+        logError('products.image.cleanup_pending', error)
       }
     }
 
-    const orphanedObjects = await rows<{ object_key: string }>(
-      'SELECT object_key FROM product_image_cleanup WHERE business_id=$1 ORDER BY created_at LIMIT 20',
-      [businessId],
-    )
+    let orphanedObjects: { object_key: string }[]
+    try {
+      orphanedObjects = await rows<{ object_key: string }>(
+        'SELECT object_key FROM product_image_cleanup WHERE business_id=$1 ORDER BY created_at LIMIT 20',
+        [businessId],
+      )
+    } catch (error) {
+      logError('products.image.orphan_cleanup_list', error)
+      return 0
+    }
     for (const object of orphanedObjects) {
       try {
         await deleteProductImageObject(object.object_key)
         await rows('DELETE FROM product_image_cleanup WHERE business_id=$1 AND object_key=$2', [businessId, object.object_key])
       } catch (error) {
-        console.error(`Orphaned product image cleanup is pending for business ${businessId}:`, error)
+        logError('products.image.orphan_cleanup_pending', error)
       }
     }
   }
 
-  const pending = await row<{ count: number }>(
-    `SELECT (
-       (SELECT count(*) FROM product_images WHERE business_id=$1 AND deleted_at IS NOT NULL)
-       + (SELECT count(*) FROM product_image_cleanup WHERE business_id=$1)
-     )::int AS count`,
-    [businessId],
-  )
-  return pending?.count || 0
+  try {
+    const pending = await row<{ count: number }>(
+      `SELECT (
+         (SELECT count(*) FROM product_images WHERE business_id=$1 AND deleted_at IS NOT NULL)
+         + (SELECT count(*) FROM product_image_cleanup WHERE business_id=$1)
+       )::int AS count`,
+      [businessId],
+    )
+    return pending?.count || 0
+  } catch (error) {
+    logError('products.image.cleanup_count', error)
+    return 0
+  }
 }
 
 async function productImagesFor(businessId: number, productIds: number[]): Promise<Map<number, Record<string, unknown>[]>> {
@@ -1634,7 +1659,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (failure.code === '23514' || failure.code === '22P02' || failure.code === '22007' || failure.code === '22008') return fail(res, 422, 'The given data was invalid.')
   if (failure.status === 400) return fail(res, 400, 'The request body is not valid JSON.')
   if (failure.status) return fail(res, failure.status, failure.message)
-  console.error(failure)
+  logError(`api.unhandled ${_req.method} ${_req.baseUrl}${_req.route?.path || _req.path}`, error)
   return fail(res, 500, 'An unexpected server error occurred.')
 })
 
