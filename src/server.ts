@@ -249,7 +249,12 @@ const businessAccess: Handler = asyncRoute(async (req, res, next) => {
 
 function permission(name: string): Handler {
   return (req, res, next) => {
-    if (req.membership?.role !== 'owner' && !req.membership?.permissions?.includes(name)) {
+    const employeeCanViewStockForSales = req.membership?.role === 'employee'
+      && name === 'products.view'
+      && req.membership.permissions?.includes('sales.create')
+    const employeeCanManageDebts = req.membership?.role === 'employee'
+      && ['debts.view', 'debts.create'].includes(name)
+    if (req.membership?.role !== 'owner' && !req.membership?.permissions?.includes(name) && !employeeCanViewStockForSales && !employeeCanManageDebts) {
       return fail(res, 403, 'You do not have permission to perform this action.')
     }
     return next()
