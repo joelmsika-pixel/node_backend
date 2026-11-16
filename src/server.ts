@@ -7,6 +7,7 @@ import { ipKeyGenerator, rateLimit } from 'express-rate-limit'
 import bcrypt from 'bcryptjs'
 import multer from 'multer'
 import nodemailer from 'nodemailer'
+import type { PoolClient } from 'pg'
 import { row, rows, transaction } from './db.js'
 import { logError } from './safe-logger.js'
 import {
@@ -444,6 +445,7 @@ admin.post('/businesses', writeLimiter, asyncRoute(async (req, res) => {
     let created = false
     if (!owner) {
       if (text(body.owner_password).length < 12) throw Object.assign(new Error('A password of at least 12 characters is required for a new owner account.'), { status: 422 })
+      if (body.owner_password !== body.owner_password_confirmation) throw Object.assign(new Error('The password confirmation does not match.'), { status: 422 })
       owner = await row<User>(
         `INSERT INTO users (name,email,phone,password,is_platform_admin,is_active,created_at,updated_at)
          VALUES($1,$2,$3,$4,false,true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING *`,
@@ -1287,7 +1289,7 @@ business.get('/employees', permission('employees.view'), asyncRoute(async (req, 
   return res.json(employees.map((employee) => ({
     ...employee,
     email: employee.is_active ? employee.email : null,
-    restore_email: employee.is_active ? null : employee.removed_email,
+    restore_email: employee.is_active ? null : employee.removed_email || employee.email,
     permissions: employee.permissions || [],
   })))
 }))
@@ -1363,18 +1365,138 @@ business.patch('/employees/:employee', permission('employees.manage'), writeLimi
   }
   return fail(res, 422, 'The is_active field must be true or false.')
 }))
+async function deleteEmployeeBusinessData(businessId: number, userId: number, client: PoolClient): Promise<string[]> {
+  const sales = await rows<{ id: number }>(
+    'SELECT id FROM sales WHERE business_id=$1 AND created_by=$2 FOR UPDATE',
+    [businessId, userId],
+    client,
+  )
+  const saleIds = sales.map((sale) => sale.id)
+  const paymentSales = await rows<{ id: number }>(
+    `SELECT DISTINCT sale_id AS id FROM sale_payments
+     WHERE business_id=$1 AND received_by=$2 AND NOT (sale_id=ANY($3::bigint[]))`,
+    [businessId, userId, saleIds],
+    client,
+  )
+  const affectedSaleIds = paymentSales.map((sale) => sale.id)
+  await client.query(
+    'DELETE FROM sale_payments WHERE business_id=$1 AND (received_by=$2 OR sale_id=ANY($3::bigint[]))',
+    [businessId, userId, saleIds],
+  )
+  if (saleIds.length) {
+    await client.query('DELETE FROM sale_items WHERE business_id=$1 AND sale_id=ANY($2::bigint[])', [businessId, saleIds])
+    await client.query('DELETE FROM sales WHERE business_id=$1 AND id=ANY($2::bigint[])', [businessId, saleIds])
+  }
+  if (affectedSaleIds.length) {
+    await client.query(
+      `UPDATE sales s SET status=CASE
+         WHEN COALESCE((SELECT sum(p.amount) FROM sale_payments p WHERE p.sale_id=s.id AND p.voided_at IS NULL),0)>=s.total_amount THEN 'paid'
+         WHEN COALESCE((SELECT sum(p.amount) FROM sale_payments p WHERE p.sale_id=s.id AND p.voided_at IS NULL),0)>0 THEN 'partial'
+         ELSE 'unpaid' END,
+         updated_at=CURRENT_TIMESTAMP
+       WHERE s.business_id=$1 AND s.id=ANY($2::bigint[])`,
+      [businessId, affectedSaleIds],
+    )
+  }
+
+  await client.query(
+    `DELETE FROM business_loan_repayments
+     WHERE business_id=$1 AND (received_by=$2 OR business_loan_id IN (
+       SELECT id FROM business_loans WHERE business_id=$1 AND created_by=$2
+     ))`,
+    [businessId, userId],
+  )
+  await client.query('DELETE FROM business_loans WHERE business_id=$1 AND created_by=$2', [businessId, userId])
+  await client.query('DELETE FROM income_records WHERE business_id=$1 AND created_by=$2', [businessId, userId])
+  await client.query('DELETE FROM expenses WHERE business_id=$1 AND created_by=$2', [businessId, userId])
+  await client.query('DELETE FROM business_messages WHERE business_id=$1 AND (sender_id=$2 OR recipient_id=$2)', [businessId, userId])
+
+  const products = await rows<{ id: number }>(
+    'SELECT id FROM products WHERE business_id=$1 AND created_by=$2 FOR UPDATE',
+    [businessId, userId],
+    client,
+  )
+  const productIds = products.map((product) => product.id)
+  if (!productIds.length) return []
+  const images = await rows<{ image_key: string; thumbnail_key: string }>(
+    'SELECT image_key,thumbnail_key FROM product_images WHERE business_id=$1 AND product_id=ANY($2::bigint[])',
+    [businessId, productIds],
+    client,
+  )
+  await client.query('DELETE FROM products WHERE business_id=$1 AND id=ANY($2::bigint[])', [businessId, productIds])
+  return images.flatMap((image) => [image.image_key, image.thumbnail_key])
+}
+
 business.delete('/employees/:employee', permission('employees.manage'), asyncRoute(async (req, res) => {
   if (req.membership?.role !== 'owner') return fail(res, 403, 'Only the business owner can remove employees.')
+  if (req.body?.delete_data !== undefined && typeof req.body.delete_data !== 'boolean') return fail(res, 422, 'The delete_data field must be true or false.')
+  const deleteData = req.body?.delete_data === true
   const employeeId = Number(req.params.employee)
-  const result = await rows(
-    `UPDATE business_user SET is_active=false,updated_at=CURRENT_TIMESTAMP
-     WHERE business_id=$1 AND user_id=$2 AND role='employee' RETURNING user_id`,
-    [req.business!.id, employeeId],
-  )
-  if (!result.length) return fail(res, 404, 'Employee not found.')
-  await rows('DELETE FROM api_access_tokens WHERE user_id=$1', [employeeId])
-  await rows('DELETE FROM api_refresh_tokens WHERE user_id=$1', [employeeId])
-  return res.json({ message: 'Employee removed.' })
+  const result = await transaction(async (client) => {
+    const employee = await row<{ user_id: number; email: string }>(
+      `SELECT m.user_id,u.email FROM business_user m JOIN users u ON u.id=m.user_id
+       WHERE m.business_id=$1 AND m.user_id=$2 AND m.role='employee' FOR UPDATE OF m,u`,
+      [req.business!.id, employeeId],
+      client,
+    )
+    if (!employee) throw Object.assign(new Error('Employee not found.'), { status: 404 })
+
+    const productImageKeys = deleteData
+      ? await deleteEmployeeBusinessData(req.business!.id, employee.user_id, client)
+      : []
+    await audit(
+      req.business!.id,
+      req.user!.id,
+      deleteData ? 'employee.removed_data_deleted' : 'employee.removed',
+      'App\\Models\\User',
+      employee.user_id,
+      { is_active: true },
+      { is_active: false, business_data_deleted: deleteData },
+      client,
+    )
+
+    const otherMemberships = await row<{ count: number }>(
+      'SELECT count(*)::int AS count FROM business_user WHERE user_id=$1 AND business_id<>$2',
+      [employee.user_id, req.business!.id],
+      client,
+    )
+    if (deleteData && !otherMemberships?.count) {
+      await client.query('DELETE FROM api_access_tokens WHERE user_id=$1', [employee.user_id])
+      await client.query('DELETE FROM api_refresh_tokens WHERE user_id=$1', [employee.user_id])
+      await client.query('DELETE FROM api_password_resets WHERE lower(email)=lower($1)', [employee.email])
+      await client.query('DELETE FROM business_user WHERE business_id=$1 AND user_id=$2', [req.business!.id, employee.user_id])
+      await client.query('DELETE FROM users WHERE id=$1', [employee.user_id])
+      return { productImageKeys, accountDeleted: true }
+    }
+
+    await client.query(
+      'UPDATE business_user SET is_active=false,updated_at=CURRENT_TIMESTAMP WHERE business_id=$1 AND user_id=$2',
+      [req.business!.id, employee.user_id],
+    )
+    const activeMemberships = await row<{ count: number }>(
+      'SELECT count(*)::int AS count FROM business_user WHERE user_id=$1 AND is_active=true',
+      [employee.user_id],
+      client,
+    )
+    if (!activeMemberships?.count) {
+      await client.query(
+        `UPDATE users SET removed_email=COALESCE(removed_email,email),email='removed-'||id||'@account.invalid',
+         password=$1,is_active=false,remember_token=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=$2`,
+        [await bcrypt.hash(randomBytes(48).toString('hex'), 12), employee.user_id],
+      )
+      await client.query('DELETE FROM api_access_tokens WHERE user_id=$1', [employee.user_id])
+      await client.query('DELETE FROM api_refresh_tokens WHERE user_id=$1', [employee.user_id])
+    }
+    return { productImageKeys, accountDeleted: false }
+  })
+  await cleanupUploadedProductImages(req.business!.id, result.productImageKeys)
+  return res.json({
+    message: deleteData
+      ? result.accountDeleted
+        ? 'Employee records and account were permanently deleted.'
+        : 'Employee records were permanently deleted from this business. The account remains for other business memberships.'
+      : 'Employee access was removed. Existing records were preserved.',
+  })
 }))
 
 business.get('/inbox', asyncRoute(async (req, res) => {
