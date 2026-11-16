@@ -167,6 +167,10 @@ Optional variables:
 - `BUSINESS_CURRENCIES`, `ACCESS_TOKEN_EXPIRATION_MINUTES`, and
   `REFRESH_TOKEN_EXPIRATION_DAYS` — API defaults are documented in
   `.env.example`.
+- Sessions expire after 15 minutes without user activity. Authenticated API
+  requests and `POST /api/session/activity` extend the refresh-token idle
+  expiration. Access tokens keep their configured lifetime, and refresh tokens
+  retain their configured maximum lifetime.
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, and
   `SMTP_FROM` — configure these to enable password reset emails. Legacy `MAIL_*`
   aliases are also accepted by the application.

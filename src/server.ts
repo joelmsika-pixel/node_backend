@@ -53,6 +53,7 @@ type Handler = (req: ApiRequest, res: Response, next: NextFunction) => unknown
 const app = express()
 const accessMinutes = Number(process.env.ACCESS_TOKEN_EXPIRATION_MINUTES || 15)
 const refreshDays = Number(process.env.REFRESH_TOKEN_EXPIRATION_DAYS || 7)
+const sessionIdleMinutes = 15
 const currencies = new Set((process.env.BUSINESS_CURRENCIES || 'TZS,KES,UGX,USD').split(','))
 const frontendUrls = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000')
   .split(',').map((url) => url.trim()).filter(Boolean)
@@ -186,8 +187,8 @@ async function issuePair(user: User, deviceName: string): Promise<Record<string,
   const accessToken = randomBytes(48).toString('base64url')
   const refreshToken = randomBytes(60).toString('base64url')
   const accessId = randomUUID()
-  const expiresAt = new Date(Date.now() + accessMinutes * 60_000)
-  const refreshExpiresAt = new Date(Date.now() + refreshDays * 86_400_000)
+  const expiresAt = new Date(Date.now() + Math.min(accessMinutes, sessionIdleMinutes) * 60_000)
+  const refreshExpiresAt = new Date(Date.now() + Math.min(sessionIdleMinutes, refreshDays * 24 * 60) * 60_000)
   await transaction(async (client) => {
     await client.query('DELETE FROM api_access_tokens WHERE user_id=$1 AND device_name=$2', [user.id, deviceName])
     await client.query(
@@ -214,6 +215,30 @@ const authenticate: Handler = asyncRoute(async (req, res, next) => {
     [hash(token)],
   )
   if (!user) return fail(res, 401, 'Unauthenticated.')
+  const sessionValid = await transaction(async (client) => {
+    const accessToken = await row<{ id: string }>(
+      'SELECT id FROM api_access_tokens WHERE id=$1 AND expires_at>CURRENT_TIMESTAMP FOR UPDATE',
+      [user.token_id],
+      client,
+    )
+    const refreshToken = await row<{ id: number }>(
+      'SELECT id FROM api_refresh_tokens WHERE access_token_id=$1 AND expires_at>CURRENT_TIMESTAMP FOR UPDATE',
+      [user.token_id],
+      client,
+    )
+    if (!accessToken || !refreshToken) return false
+    await client.query(
+      `UPDATE api_refresh_tokens
+       SET expires_at=LEAST(
+         created_at + ($2 * INTERVAL '1 day'),
+         CURRENT_TIMESTAMP + ($3 * INTERVAL '1 minute')
+       )
+       WHERE access_token_id=$1`,
+      [user.token_id, refreshDays, sessionIdleMinutes],
+    )
+    return true
+  })
+  if (!sessionValid) return fail(res, 401, 'Unauthenticated.')
   req.user = user
   res.locals.tokenId = user.token_id
   return next()
@@ -403,8 +428,21 @@ app.post('/api/reset-password', rateLimit({ windowMs: 60_000, limit: 10, standar
 }))
 
 app.get('/api/me', authenticate, asyncRoute(async (req, res) => res.json(await userPayload(req.user!))))
-app.post('/api/logout', authenticate, asyncRoute(async (_req, res) => {
-  await rows('DELETE FROM api_access_tokens WHERE id=$1', [res.locals.tokenId])
+app.post('/api/session/activity', authenticate, (_req, res) => res.sendStatus(204))
+app.post('/api/logout', asyncRoute(async (req, res) => {
+  const accessToken = req.header('authorization')?.replace(/^Bearer\s+/i, '')
+  const refreshToken = text(req.body?.refresh_token)
+  await transaction(async (client) => {
+    if (refreshToken && refreshToken.length <= 200) {
+      await client.query(
+        'DELETE FROM api_access_tokens WHERE id IN (SELECT access_token_id FROM api_refresh_tokens WHERE token_hash=$1)',
+        [hash(refreshToken)],
+      )
+    }
+    if (accessToken && accessToken.length <= 200) {
+      await client.query('DELETE FROM api_access_tokens WHERE token_hash=$1', [hash(accessToken)])
+    }
+  })
   return res.json({ message: 'Signed out successfully.' })
 }))
 
