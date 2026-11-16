@@ -1232,24 +1232,57 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
   if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 100) return fail(res, 422, 'At least one sale item is required.')
   const items = body.items as Record<string, unknown>[]
   let total = 0
-  const normalized: { name: string; quantity: string; price: string; line: string }[] = []
+  const normalized: { name: string; quantity: string; price: string; line: string; productId: number | null }[] = []
   for (const item of items) {
     const quantity = Number(item.quantity)
     const price = Number(item.unit_price)
-    if (!text(item.item_name) || text(item.item_name).length > 180 || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price < 0) return fail(res, 422, 'Each item needs a name, positive quantity, and non-negative unit price.')
+    if (!text(item.item_name) || text(item.item_name).length > 180 || !Number.isFinite(quantity) || quantity <= 0 || !/^\d{1,9}(\.\d{1,3})?$/.test(String(item.quantity)) || !Number.isFinite(price) || price < 0 || !/^\d{1,10}(\.\d{1,2})?$/.test(String(item.unit_price))) return fail(res, 422, 'Each item needs a name, a positive quantity with up to 3 decimal places, and a non-negative unit price with up to 2 decimal places.')
+    const productId = item.product_id === undefined || item.product_id === null || item.product_id === ''
+      ? null
+      : Number(item.product_id)
+    if (productId !== null && (!Number.isSafeInteger(productId) || productId <= 0)) return fail(res, 422, 'The selected stock product is invalid.')
     const line = Math.round(quantity * price * 100) / 100
     total += line
-    normalized.push({ name: text(item.item_name), quantity: quantity.toFixed(3), price: price.toFixed(2), line: line.toFixed(2) })
+    normalized.push({ name: text(item.item_name), quantity: quantity.toFixed(3), price: price.toFixed(2), line: line.toFixed(2), productId })
   }
   if (total > 999999999999.99) return fail(res, 422, 'The sale total exceeds the supported amount.')
+  const customerName = text(body.customer_name)
+  if (customerName.length > 150) return fail(res, 422, 'The customer name must not be greater than 150 characters.')
+  if (!body.is_completed && normalized.some((item) => item.productId !== null) && !customerName) {
+    return fail(res, 422, 'A customer name is required for a product sold on credit.')
+  }
   const result = await transaction(async (client) => {
+    const stockProducts = new Map<number, { name: string; stock_quantity: string }>()
+    const requestedStock = new Map<number, number>()
+    for (const item of normalized) {
+      if (item.productId === null) continue
+      requestedStock.set(item.productId, (requestedStock.get(item.productId) || 0) + Number(item.quantity))
+      if (stockProducts.has(item.productId)) continue
+      const product = await row<{ id: number; name: string; stock_quantity: string }>(
+        'SELECT id,name,stock_quantity FROM products WHERE id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
+        [item.productId, req.business!.id],
+        client,
+      )
+      if (!product) throw Object.assign(new Error('The selected stock product was not found.'), { status: 422 })
+      stockProducts.set(item.productId, product)
+    }
+    for (const [productId, quantity] of requestedStock) {
+      const product = stockProducts.get(productId)!
+      if (quantity > Number(product.stock_quantity)) {
+        throw Object.assign(new Error(`Not enough stock for ${product.name}.`), { status: 422 })
+      }
+    }
+    for (const item of normalized) {
+      if (item.productId !== null) item.name = stockProducts.get(item.productId)!.name
+    }
+
     let customerId = body.customer_id ? Number(body.customer_id) : null
     if (customerId && !await row('SELECT id FROM customers WHERE id=$1 AND business_id=$2', [customerId, req.business!.id], client)) {
       throw Object.assign(new Error('The selected customer is invalid.'), { status: 422 })
     }
-    if (!customerId && text(body.customer_name)) {
-      let customer = await row<{ id: number }>('SELECT id FROM customers WHERE business_id=$1 AND lower(name)=lower($2) LIMIT 1', [req.business!.id, text(body.customer_name)], client)
-      if (!customer) customer = await row<{ id: number }>('INSERT INTO customers(business_id,name,created_at,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id', [req.business!.id, text(body.customer_name)], client)
+    if (!customerId && customerName) {
+      let customer = await row<{ id: number }>('SELECT id FROM customers WHERE business_id=$1 AND lower(name)=lower($2) LIMIT 1', [req.business!.id, customerName], client)
+      if (!customer) customer = await row<{ id: number }>('INSERT INTO customers(business_id,name,created_at,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id', [req.business!.id, customerName], client)
       customerId = customer!.id
     }
     const latest = await row<{ count: number }>('SELECT count(*)::int AS count FROM sales WHERE business_id=$1', [req.business!.id], client)
@@ -1262,9 +1295,15 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
     )
     for (const item of normalized) {
       await client.query(
-        'INSERT INTO sale_items(business_id,sale_id,item_name,quantity,unit_price,line_total,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
-        [req.business!.id, sale!.id, item.name, item.quantity, item.price, item.line],
+        'INSERT INTO sale_items(business_id,sale_id,product_id,item_name,quantity,unit_price,line_total,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+        [req.business!.id, sale!.id, item.productId, item.name, item.quantity, item.price, item.line],
       )
+      if (item.productId !== null) {
+        await client.query(
+          'UPDATE products SET stock_quantity=stock_quantity-$1,updated_by=$2,updated_at=CURRENT_TIMESTAMP WHERE id=$3 AND business_id=$4',
+          [item.quantity, req.user!.id, item.productId, req.business!.id],
+        )
+      }
     }
     if (completed) {
       await client.query(
