@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS product_images_deleted_idx
 
 CREATE TABLE IF NOT EXISTS product_image_cleanup (
   object_key TEXT PRIMARY KEY,
-  business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  business_id BIGINT REFERENCES businesses(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

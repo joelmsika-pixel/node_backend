@@ -14,6 +14,10 @@ async function migrateProducts(): Promise<void> {
     new URL('../migrations/20261113_products_and_images.sql', import.meta.url),
     'utf8',
   )
+  const cleanupMigrationSql = await readFile(
+    new URL('../migrations/20261116_persist_product_image_cleanup.sql', import.meta.url),
+    'utf8',
+  )
 
   await transaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [2026111301])
@@ -62,6 +66,7 @@ async function migrateProducts(): Promise<void> {
     }
 
     await client.query(migrationSql)
+    await client.query(cleanupMigrationSql)
 
     const employees = await rows<{
       business_id: number

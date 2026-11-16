@@ -493,13 +493,70 @@ admin.patch('/businesses/:id/status', writeLimiter, asyncRoute(async (req, res) 
   return res.json({ message: 'Business status updated.', business: { ...business, status } })
 }))
 admin.delete('/businesses/:id', writeLimiter, asyncRoute(async (req, res) => {
-  const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NULL', [Number(req.params.id)])
-  if (!business) return fail(res, 404, 'Business not found.')
-  await rows('UPDATE businesses SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=$1', [business.id])
-  const userIds = await activeBusinessUsers(business)
-  if (userIds.length) await rows('DELETE FROM api_access_tokens WHERE user_id=ANY($1::bigint[])', [userIds])
-  await audit(business.id, req.user!.id, 'business.deleted', 'App\\Models\\Business', business.id, { deleted_at: null }, { deleted_at: new Date().toISOString() })
-  return res.json({ message: 'Business removed. Its records are preserved.' })
+  if (req.body?.delete_data !== undefined && typeof req.body.delete_data !== 'boolean') return fail(res, 422, 'The delete_data field must be true or false.')
+  const deleteData = req.body?.delete_data === true
+  const businessId = Number(req.params.id)
+  if (!deleteData) {
+    const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NULL', [businessId])
+    if (!business) return fail(res, 404, 'Business not found.')
+    await rows('UPDATE businesses SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=$1', [business.id])
+    const userIds = await activeBusinessUsers(business)
+    if (userIds.length) await rows('DELETE FROM api_access_tokens WHERE user_id=ANY($1::bigint[])', [userIds])
+    await audit(business.id, req.user!.id, 'business.deleted', 'App\\Models\\Business', business.id, { deleted_at: null }, { deleted_at: new Date().toISOString() })
+    return res.json({ message: 'Business removed. Its records are preserved.' })
+  }
+
+  const result = await transaction(async (client) => {
+    const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NULL FOR UPDATE', [businessId], client)
+    if (!business) throw Object.assign(new Error('Business not found.'), { status: 404 })
+    const owners = await rows<{ user_id: number; email: string; is_platform_admin: boolean }>(
+      `SELECT m.user_id,u.email,u.is_platform_admin FROM business_user m JOIN users u ON u.id=m.user_id
+       WHERE m.business_id=$1 AND m.role='owner' FOR UPDATE OF u`,
+      [business.id],
+      client,
+    )
+    const productImages = await rows<{ image_key: string; thumbnail_key: string }>(
+      'SELECT image_key,thumbnail_key FROM product_images WHERE business_id=$1',
+      [business.id],
+      client,
+    )
+    const imageKeys = productImages.flatMap((image) => [image.image_key, image.thumbnail_key])
+    await trackProductImageCleanup(business.id, imageKeys, client)
+    await audit(
+      business.id,
+      req.user!.id,
+      'business.permanently_deleted',
+      'App\\Models\\Business',
+      business.id,
+      { name: business.name },
+      { data_deleted: true },
+      client,
+    )
+    await client.query('DELETE FROM businesses WHERE id=$1', [business.id])
+
+    let ownerAccountsDeleted = 0
+    for (const owner of owners) {
+      const membership = await row<{ count: number }>(
+        'SELECT count(*)::int AS count FROM business_user WHERE user_id=$1',
+        [owner.user_id],
+        client,
+      )
+      if (membership?.count || owner.is_platform_admin) continue
+      await client.query('DELETE FROM api_access_tokens WHERE user_id=$1', [owner.user_id])
+      await client.query('DELETE FROM api_refresh_tokens WHERE user_id=$1', [owner.user_id])
+      await client.query('DELETE FROM api_password_resets WHERE lower(email)=lower($1)', [owner.email])
+      await client.query('DELETE FROM users WHERE id=$1', [owner.user_id])
+      ownerAccountsDeleted += 1
+    }
+    return { ownerAccountsDeleted }
+  })
+
+  const cleanupPending = await retryPendingProductImageCleanup(businessId)
+  return res.json({
+    message: 'Business and its data were permanently deleted.',
+    owner_accounts_deleted: result.ownerAccountsDeleted,
+    image_cleanup_pending: cleanupPending,
+  })
 }))
 admin.post('/businesses/:id/restore', writeLimiter, asyncRoute(async (req, res) => {
   const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NOT NULL', [Number(req.params.id)])
@@ -691,13 +748,14 @@ async function optimizeUploadedProductImages(files: Express.Multer.File[]) {
   return images
 }
 
-async function trackProductImageCleanup(businessId: number, objectKeys: string[]): Promise<void> {
+async function trackProductImageCleanup(businessId: number, objectKeys: string[], client?: PoolClient): Promise<void> {
   if (!objectKeys.length) return
   await rows(
     `INSERT INTO product_image_cleanup(object_key,business_id)
      SELECT pending.object_key,$1 FROM unnest($2::text[]) AS pending(object_key)
      ON CONFLICT (object_key) DO NOTHING`,
     [businessId, objectKeys],
+    client,
   )
 }
 
@@ -748,7 +806,7 @@ async function retryPendingProductImageCleanup(businessId: number): Promise<numb
     let orphanedObjects: { object_key: string }[]
     try {
       orphanedObjects = await rows<{ object_key: string }>(
-        'SELECT object_key FROM product_image_cleanup WHERE business_id=$1 ORDER BY created_at LIMIT 20',
+        'SELECT object_key FROM product_image_cleanup WHERE business_id=$1 OR business_id IS NULL ORDER BY created_at LIMIT 20',
         [businessId],
       )
     } catch (error) {
@@ -758,7 +816,7 @@ async function retryPendingProductImageCleanup(businessId: number): Promise<numb
     for (const object of orphanedObjects) {
       try {
         await deleteProductImageObject(object.object_key)
-        await rows('DELETE FROM product_image_cleanup WHERE business_id=$1 AND object_key=$2', [businessId, object.object_key])
+        await rows('DELETE FROM product_image_cleanup WHERE object_key=$1', [object.object_key])
       } catch (error) {
         logError('products.image.orphan_cleanup_pending', error)
       }
@@ -769,7 +827,7 @@ async function retryPendingProductImageCleanup(businessId: number): Promise<numb
     const pending = await row<{ count: number }>(
       `SELECT (
          (SELECT count(*) FROM product_images WHERE business_id=$1 AND deleted_at IS NOT NULL)
-         + (SELECT count(*) FROM product_image_cleanup WHERE business_id=$1)
+         + (SELECT count(*) FROM product_image_cleanup WHERE business_id=$1 OR business_id IS NULL)
        )::int AS count`,
       [businessId],
     )
