@@ -6,3 +6,6 @@ data/*.sqlite
 !.env.example
 *.log
 Thumbs.db
+
+.vercel
+.env*
