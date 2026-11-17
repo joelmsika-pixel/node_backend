@@ -124,7 +124,7 @@ function validate(
   const errors: Record<string, string[]> = {}
   for (const [key, rules] of Object.entries(fields)) {
     const value = body[key]
-    const normalized = text(value)
+    const normalized = typeof value === 'number' && Number.isFinite(value) ? String(value) : text(value)
     if (rules.required && (value === undefined || value === null || normalized === '')) {
       errors[key] = [`The ${key.replaceAll('_', ' ')} field is required.`]
     } else if (value !== undefined && value !== null && typeof value !== 'string' && typeof value !== 'number') {
