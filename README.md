@@ -49,10 +49,11 @@ After confirming that the target PostgreSQL database has the existing
 `businesses`, `users`, and `business_user` tables, review their ID and
 permissions column types and take a verified backup. The migration checks
 these prerequisites and runs product DDL and employee-permission updates in
-one transaction. It creates only the missing `products`, `product_images`,
-and `product_image_cleanup` objects; it does not drop or rewrite application
-tables or product data. Run it explicitly from this directory against the
-intended database:
+one transaction. It creates the `products`, `product_images`, and
+`product_image_cleanup` objects as needed, and adds product and sale-item unit
+columns. Existing records receive the legacy default unit `pieces`. It does
+not drop application tables. Run it explicitly from this directory against
+the intended database:
 
 ```sh
 npm run db:migrate-products
@@ -60,6 +61,8 @@ npm run db:migrate-products
 
 The reviewed SQL is also available at
 [`migrations/20261113_products_and_images.sql`](./migrations/20261113_products_and_images.sql).
+Unit support is added by
+[`migrations/20261117_product_units.sql`](./migrations/20261117_product_units.sql).
 This command is not run at startup, during build, or during deployment. For
 production, run it from a trusted environment configured with the production
 database URL only after verifying the URL target and backup. Confirm that it

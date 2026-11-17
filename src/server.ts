@@ -676,6 +676,7 @@ type ProductValues = {
   cost_price: string | null
   sku: string | null
   category: string
+  unit: string
   stock_quantity: string
 }
 
@@ -736,18 +737,28 @@ function productValues(body: Record<string, unknown>, res: Response): ProductVal
     cost_price: {},
     sku: { max: 100 },
     category: { required: true, max: 100 },
+    unit: { max: 40 },
     stock_quantity: { required: true },
   })) return null
 
+  if (body.unit !== undefined && body.unit !== null && typeof body.unit !== 'string') {
+    return fail(res, 422, 'Unit must be text.'), null
+  }
   const numericText = (value: unknown) => (
     typeof value === 'number' && Number.isFinite(value) ? String(value) : text(value)
   )
   const sellingPrice = numericText(body.selling_price)
   const costPrice = numericText(body.cost_price)
   const stockQuantity = numericText(body.stock_quantity)
+  const requestedUnit = text(body.unit)
+  if (body.unit !== undefined && body.unit !== null && !requestedUnit) {
+    return fail(res, 422, 'Unit cannot be empty.'), null
+  }
+  const unit = requestedUnit || 'pieces'
   if (!/^\d{1,10}(\.\d{1,2})?$/.test(sellingPrice)) return fail(res, 422, 'Selling price must be a non-negative amount with up to 2 decimal places.'), null
   if (costPrice && !/^\d{1,10}(\.\d{1,2})?$/.test(costPrice)) return fail(res, 422, 'Cost price must be a non-negative amount with up to 2 decimal places.'), null
   if (!/^\d{1,9}(\.\d{1,3})?$/.test(stockQuantity)) return fail(res, 422, 'Stock quantity must be non-negative with up to 3 decimal places.'), null
+  if (unit.length > 40) return fail(res, 422, 'Unit must not be greater than 40 characters.'), null
 
   return {
     name: text(body.name),
@@ -756,6 +767,7 @@ function productValues(body: Record<string, unknown>, res: Response): ProductVal
     cost_price: costPrice || null,
     sku: text(body.sku) || null,
     category: text(body.category),
+    unit,
     stock_quantity: stockQuantity,
   }
 }
@@ -907,7 +919,7 @@ async function productImagesFor(businessId: number, productIds: number[]): Promi
 }
 
 function productFields(body: ProductValues): unknown[] {
-  return [body.name, body.description, body.selling_price, body.cost_price, body.sku, body.category, body.stock_quantity]
+  return [body.name, body.description, body.selling_price, body.cost_price, body.sku, body.category, body.unit, body.stock_quantity]
 }
 
 business.get('/products', permission('products.view'), asyncRoute(async (req, res) => {
@@ -931,15 +943,21 @@ business.get('/products', permission('products.view'), asyncRoute(async (req, re
     `SELECT count(*)::int AS count FROM products p WHERE ${filter}`,
     [businessId, search, category, stockStatus],
   ))?.count || 0
-  const categoryStock = await rows<{ category: string; product_count: number; remaining_quantity: string }>(
-    `SELECT category,count(*)::int AS product_count,COALESCE(sum(stock_quantity),0)::text AS remaining_quantity
-     FROM products WHERE business_id=$1 AND deleted_at IS NULL GROUP BY category ORDER BY category`,
+  const categoryStock = await rows<{ category: string; unit: string; product_count: number; remaining_quantity: string }>(
+    `SELECT category,unit,count(*)::int AS product_count,COALESCE(sum(stock_quantity),0)::text AS remaining_quantity
+     FROM products WHERE business_id=$1 AND deleted_at IS NULL GROUP BY category,unit ORDER BY category,unit`,
     [businessId],
   )
   const images = await productImagesFor(businessId, products.map((product) => product.id))
   const data = products.map((product) => ({ ...product, images: images.get(product.id) || [] }))
   const meta = { current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total }
-  return res.json({ data, categories: categoryStock.map((item) => item.category), category_stock: categoryStock, meta, ...meta })
+  return res.json({
+    data,
+    categories: [...new Set(categoryStock.map((item) => item.category))],
+    category_stock: categoryStock,
+    meta,
+    ...meta,
+  })
 }))
 
 business.post('/products', permission('products.create'), writeLimiter, parseProductImages, asyncRoute(async (req, res) => {
@@ -954,8 +972,8 @@ business.post('/products', permission('products.create'), writeLimiter, parsePro
   try {
     product = await transaction(async (client) => {
       const saved = await row<ProductRow>(
-        `INSERT INTO products(business_id,name,description,selling_price,cost_price,sku,category,stock_quantity,created_by,updated_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *`,
+        `INSERT INTO products(business_id,name,description,selling_price,cost_price,sku,category,unit,stock_quantity,created_by,updated_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10) RETURNING *`,
         [req.business!.id, ...productFields(input), req.user!.id],
         client,
       )
@@ -1008,6 +1026,9 @@ business.patch('/products/:product', permission('products.edit'), writeLimiter, 
         client,
       )
       if (!current) throw Object.assign(new Error('Product not found.'), { status: 404 })
+      if (req.body.unit === undefined || req.body.unit === null) {
+        input.unit = current.unit
+      }
 
       const currentImages = await rows<ProductImageRow>(
         'SELECT * FROM product_images WHERE product_id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
@@ -1024,9 +1045,9 @@ business.patch('/products/:product', permission('products.edit'), writeLimiter, 
       }
 
       const updated = await row<ProductRow>(
-        `UPDATE products SET name=$1,description=$2,selling_price=$3,cost_price=$4,sku=$5,category=$6,stock_quantity=$7,
-         updated_by=$8,updated_at=CURRENT_TIMESTAMP
-         WHERE id=$9 AND business_id=$10 AND deleted_at IS NULL RETURNING *`,
+        `UPDATE products SET name=$1,description=$2,selling_price=$3,cost_price=$4,sku=$5,category=$6,unit=$7,stock_quantity=$8,
+         updated_by=$9,updated_at=CURRENT_TIMESTAMP
+         WHERE id=$10 AND business_id=$11 AND deleted_at IS NULL RETURNING *`,
         [...productFields(input), req.user!.id, productId, req.business!.id],
         client,
       )
@@ -1275,18 +1296,38 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
   if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 100) return fail(res, 422, 'At least one sale item is required.')
   const items = body.items as Record<string, unknown>[]
   let total = 0
-  const normalized: { name: string; quantity: string; price: string; line: string; productId: number | null }[] = []
+  const normalized: {
+    name: string
+    quantity: string
+    price: string
+    line: string
+    productId: number | null
+    unit: string
+    unitWasProvided: boolean
+  }[] = []
   for (const item of items) {
     const quantity = Number(item.quantity)
     const price = Number(item.unit_price)
     if (!text(item.item_name) || text(item.item_name).length > 180 || !Number.isFinite(quantity) || quantity <= 0 || !/^\d{1,9}(\.\d{1,3})?$/.test(String(item.quantity)) || !Number.isFinite(price) || price < 0 || !/^\d{1,10}(\.\d{1,2})?$/.test(String(item.unit_price))) return fail(res, 422, 'Each item needs a name, a positive quantity with up to 3 decimal places, and a non-negative unit price with up to 2 decimal places.')
+    if (item.unit !== undefined && item.unit !== null && typeof item.unit !== 'string') return fail(res, 422, 'Each item unit must be text.')
+    const requestedUnit = text(item.unit)
+    if (item.unit !== undefined && item.unit !== null && !requestedUnit) return fail(res, 422, 'Each item unit cannot be empty.')
+    if (requestedUnit.length > 40) return fail(res, 422, 'Each item unit must not be greater than 40 characters.')
     const productId = item.product_id === undefined || item.product_id === null || item.product_id === ''
       ? null
       : Number(item.product_id)
     if (productId !== null && (!Number.isSafeInteger(productId) || productId <= 0)) return fail(res, 422, 'The selected stock product is invalid.')
     const line = Math.round(quantity * price * 100) / 100
     total += line
-    normalized.push({ name: text(item.item_name), quantity: quantity.toFixed(3), price: price.toFixed(2), line: line.toFixed(2), productId })
+    normalized.push({
+      name: text(item.item_name),
+      quantity: quantity.toFixed(3),
+      price: price.toFixed(2),
+      line: line.toFixed(2),
+      productId,
+      unit: requestedUnit || 'pieces',
+      unitWasProvided: Boolean(requestedUnit),
+    })
   }
   if (total > 999999999999.99) return fail(res, 422, 'The sale total exceeds the supported amount.')
   const customerName = text(body.customer_name)
@@ -1295,14 +1336,14 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
     return fail(res, 422, 'A customer name is required for a product sold on credit.')
   }
   const result = await transaction(async (client) => {
-    const stockProducts = new Map<number, { name: string; stock_quantity: string }>()
+    const stockProducts = new Map<number, { name: string; unit: string; stock_quantity: string }>()
     const requestedStock = new Map<number, number>()
     for (const item of normalized) {
       if (item.productId === null) continue
       requestedStock.set(item.productId, (requestedStock.get(item.productId) || 0) + Number(item.quantity))
       if (stockProducts.has(item.productId)) continue
-      const product = await row<{ id: number; name: string; stock_quantity: string }>(
-        'SELECT id,name,stock_quantity FROM products WHERE id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
+      const product = await row<{ id: number; name: string; unit: string; stock_quantity: string }>(
+        'SELECT id,name,unit,stock_quantity FROM products WHERE id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
         [item.productId, req.business!.id],
         client,
       )
@@ -1316,7 +1357,14 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
       }
     }
     for (const item of normalized) {
-      if (item.productId !== null) item.name = stockProducts.get(item.productId)!.name
+      if (item.productId !== null) {
+        const product = stockProducts.get(item.productId)!
+        if (item.unitWasProvided && item.unit.toLowerCase() !== product.unit.toLowerCase()) {
+          throw Object.assign(new Error(`The sale unit for ${product.name} must match its stock unit (${product.unit}).`), { status: 422 })
+        }
+        item.name = product.name
+        item.unit = product.unit
+      }
     }
 
     let customerId = body.customer_id ? Number(body.customer_id) : null
@@ -1338,8 +1386,8 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
     )
     for (const item of normalized) {
       await client.query(
-        'INSERT INTO sale_items(business_id,sale_id,product_id,item_name,quantity,unit_price,line_total,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
-        [req.business!.id, sale!.id, item.productId, item.name, item.quantity, item.price, item.line],
+        'INSERT INTO sale_items(business_id,sale_id,product_id,item_name,quantity,unit,unit_price,line_total,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+        [req.business!.id, sale!.id, item.productId, item.name, item.quantity, item.unit, item.price, item.line],
       )
       if (item.productId !== null) {
         await client.query(
@@ -1704,7 +1752,9 @@ business.get('/debts', permission('debts.view'), asyncRoute(async (req, res) => 
   )
   const sales = await rows(
     `SELECT s.*,c.name AS borrower_name,c.phone AS borrower_phone,
-       COALESCE(sum(p.amount),0)::text AS paid_amount,(s.total_amount-COALESCE(sum(p.amount),0))::text AS balance
+       COALESCE(sum(p.amount),0)::text AS paid_amount,(s.total_amount-COALESCE(sum(p.amount),0))::text AS balance,
+       COALESCE((SELECT json_agg(json_build_object('item_name',i.item_name,'quantity',i.quantity,'unit',i.unit))
+         FROM sale_items i WHERE i.sale_id=s.id),'[]'::json) AS items
      FROM sales s LEFT JOIN customers c ON c.id=s.customer_id
      LEFT JOIN sale_payments p ON p.sale_id=s.id AND p.voided_at IS NULL
      WHERE s.business_id=$1 AND s.voided_at IS NULL GROUP BY s.id,c.name,c.phone ORDER BY s.sale_date DESC`,
@@ -1715,7 +1765,7 @@ business.get('/debts', permission('debts.view'), asyncRoute(async (req, res) => 
       id: `sale-${sale.id}`, loan_id: null, loan_type: 'sale', sale_number: sale.sale_number,
       description: `Mauzo ${sale.sale_number}`, borrower_name: sale.borrower_name || '—',
       borrower_phone: sale.borrower_phone, loan_date: sale.sale_date, principal: sale.total_amount,
-      paid_amount: sale.paid_amount, balance: sale.balance, due_date: sale.due_date,
+      paid_amount: sale.paid_amount, balance: sale.balance, due_date: sale.due_date, items: sale.items,
       status: Number(sale.paid_amount) > 0 ? 'partial' : 'unpaid',
     })),
     ...loans.map((loan) => ({
@@ -1768,8 +1818,8 @@ business.post('/loans/:loan/repayments', permission('debts.create'), writeLimite
         [req.business!.id, `SALE-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${String((count?.count || 0)+1).padStart(5,'0')}`, body.payment_date, amount.toFixed(2), req.user!.id], client,
       )
       await client.query(
-        `INSERT INTO sale_items(business_id,sale_id,item_name,quantity,unit_price,line_total,created_at,updated_at)
-         VALUES($1,$2,'Loan repayment','1.000',$3,$3,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+        `INSERT INTO sale_items(business_id,sale_id,item_name,quantity,unit,unit_price,line_total,created_at,updated_at)
+         VALUES($1,$2,'Loan repayment','1.000','amount',$3,$3,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
         [req.business!.id, sale!.id, amount.toFixed(2)],
       )
       await client.query(
