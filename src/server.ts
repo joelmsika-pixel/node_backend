@@ -932,14 +932,15 @@ business.get('/products', permission('products.view'), asyncRoute(async (req, re
     `SELECT count(*)::int AS count FROM products p WHERE ${filter}`,
     [businessId, search, category, stockStatus],
   ))?.count || 0
-  const categories = await rows<{ category: string }>(
-    'SELECT DISTINCT category FROM products WHERE business_id=$1 AND deleted_at IS NULL ORDER BY category',
+  const categoryStock = await rows<{ category: string; product_count: number; remaining_quantity: string }>(
+    `SELECT category,count(*)::int AS product_count,COALESCE(sum(stock_quantity),0)::text AS remaining_quantity
+     FROM products WHERE business_id=$1 AND deleted_at IS NULL GROUP BY category ORDER BY category`,
     [businessId],
   )
   const images = await productImagesFor(businessId, products.map((product) => product.id))
   const data = products.map((product) => ({ ...product, images: images.get(product.id) || [] }))
   const meta = { current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total }
-  return res.json({ data, categories: categories.map((item) => item.category), meta, ...meta })
+  return res.json({ data, categories: categoryStock.map((item) => item.category), category_stock: categoryStock, meta, ...meta })
 }))
 
 business.post('/products', permission('products.create'), writeLimiter, parseProductImages, asyncRoute(async (req, res) => {
