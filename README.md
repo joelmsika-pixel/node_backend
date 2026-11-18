@@ -170,7 +170,7 @@ Optional variables:
 - `BUSINESS_CURRENCIES`, `ACCESS_TOKEN_EXPIRATION_MINUTES`, and
   `REFRESH_TOKEN_EXPIRATION_DAYS` — API defaults are documented in
   `.env.example`.
-- Sessions expire after 15 minutes without user activity. Authenticated API
+- Sessions expire after 12 hours without user activity. Authenticated API
   requests and `POST /api/session/activity` extend the refresh-token idle
   expiration. Access tokens keep their configured lifetime, and refresh tokens
   retain their configured maximum lifetime.

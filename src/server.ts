@@ -53,7 +53,7 @@ type Handler = (req: ApiRequest, res: Response, next: NextFunction) => unknown
 const app = express()
 const accessMinutes = Number(process.env.ACCESS_TOKEN_EXPIRATION_MINUTES || 15)
 const refreshDays = Number(process.env.REFRESH_TOKEN_EXPIRATION_DAYS || 7)
-const sessionIdleMinutes = 15
+const sessionIdleMinutes = 12 * 60
 const currencies = new Set((process.env.BUSINESS_CURRENCIES || 'TZS,KES,UGX,USD').split(','))
 const frontendUrls = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000')
   .split(',').map((url) => url.trim()).filter(Boolean)
