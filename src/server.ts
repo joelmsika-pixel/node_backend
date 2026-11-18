@@ -10,6 +10,7 @@ import nodemailer from 'nodemailer'
 import type { PoolClient } from 'pg'
 import { row, rows, transaction } from './db.js'
 import { logError } from './safe-logger.js'
+import { parsePcInspectionDevices, type PcInspectionDevice } from './pc-inspections.js'
 import {
   deleteProductImageObject,
   isProductImageStorageConfigured,
@@ -921,6 +922,78 @@ async function productImagesFor(businessId: number, productIds: number[]): Promi
 function productFields(body: ProductValues): unknown[] {
   return [body.name, body.description, body.selling_price, body.cost_price, body.sku, body.category, body.unit, body.stock_quantity]
 }
+
+type PcInspectionReportRow = {
+  id: number
+  business_name: string
+  prepared_by_name: string
+  device_count: number
+  devices: PcInspectionDevice[]
+  created_at: Date
+}
+
+business.get('/pc-inspection-reports', permission('products.view'), asyncRoute(async (req, res) => {
+  const { page, perPage, offset } = pageOptions(req)
+  const reports = await rows<Omit<PcInspectionReportRow, 'devices'>>(
+    `SELECT id,business_name,prepared_by_name,device_count,created_at
+     FROM pc_inspection_reports WHERE business_id=$1
+     ORDER BY created_at DESC,id DESC LIMIT $2 OFFSET $3`,
+    [req.business!.id, perPage, offset],
+  )
+  const total = (await row<{ count: number }>(
+    'SELECT count(*)::int AS count FROM pc_inspection_reports WHERE business_id=$1',
+    [req.business!.id],
+  ))?.count || 0
+  const meta = { current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total }
+  return res.json({ data: reports, meta, ...meta })
+}))
+
+business.get('/pc-inspection-reports/:report', permission('products.view'), asyncRoute(async (req, res) => {
+  const reportId = Number(req.params.report)
+  if (!Number.isSafeInteger(reportId) || reportId <= 0) return fail(res, 404, 'PC inspection report not found.')
+  const report = await row<PcInspectionReportRow>(
+    `SELECT id,business_name,prepared_by_name,device_count,devices,created_at
+     FROM pc_inspection_reports WHERE id=$1 AND business_id=$2`,
+    [reportId, req.business!.id],
+  )
+  if (!report) return fail(res, 404, 'PC inspection report not found.')
+  return res.json({ data: report })
+}))
+
+business.post('/pc-inspection-reports', permission('products.create'), writeLimiter, asyncRoute(async (req, res) => {
+  const parsed = parsePcInspectionDevices(req.body?.devices)
+  if (!parsed.ok) return fail(res, 422, parsed.error)
+  const report = await transaction(async (client) => {
+    const saved = await row<PcInspectionReportRow>(
+      `INSERT INTO pc_inspection_reports
+       (business_id,created_by,business_name,prepared_by_name,device_count,devices)
+       VALUES($1,$2,$3,$4,$5,$6::jsonb)
+       RETURNING id,business_name,prepared_by_name,device_count,devices,created_at`,
+      [
+        req.business!.id,
+        req.user!.id,
+        req.business!.name,
+        req.user!.name,
+        parsed.devices.length,
+        JSON.stringify(parsed.devices),
+      ],
+      client,
+    )
+    if (!saved) throw new Error('PC inspection report insert did not return a row.')
+    await audit(
+      req.business!.id,
+      req.user!.id,
+      'pc_inspection_report.created',
+      'PcInspectionReport',
+      saved.id,
+      null,
+      { device_count: saved.device_count },
+      client,
+    )
+    return saved
+  })
+  return res.status(201).json({ data: report })
+}))
 
 business.get('/products', permission('products.view'), asyncRoute(async (req, res) => {
   const businessId = req.business!.id

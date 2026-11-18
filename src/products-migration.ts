@@ -26,6 +26,10 @@ async function migrateProducts(): Promise<void> {
     new URL('../migrations/20261117_product_units.sql', import.meta.url),
     'utf8',
   )
+  const pcInspectionReportsMigrationSql = await readFile(
+    new URL('../migrations/20261118_pc_inspection_reports.sql', import.meta.url),
+    'utf8',
+  )
 
   await transaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1)', [2026111301])
@@ -77,6 +81,7 @@ async function migrateProducts(): Promise<void> {
     await client.query(cleanupMigrationSql)
     await client.query(saleItemsMigrationSql)
     await client.query(productUnitsMigrationSql)
+    await client.query(pcInspectionReportsMigrationSql)
 
     const employees = await rows<{
       business_id: number
@@ -109,7 +114,7 @@ async function migrateProducts(): Promise<void> {
 
 try {
   await migrateProducts()
-  console.log('Product tables and employee permissions are ready.')
+  console.log('Product tables, PC inspection report history, and employee permissions are ready.')
 } catch (error) {
   logError('products.migration', error)
   process.exitCode = 1

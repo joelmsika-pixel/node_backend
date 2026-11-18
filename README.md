@@ -45,14 +45,22 @@ authorized by the existing owner rule. The product migration adds these four
 permissions to current employee memberships; newly created employees receive
 them by default.
 
+PC inspection reports are business-scoped at
+`/api/businesses/{business}/pc-inspection-reports`. Owners and employees with
+product access can create a batch with `POST`, list saved report history with
+`GET`, and retrieve an individual report with `GET /:report` for PDF download.
+Each report snapshots the business and preparer names and stores its PC
+inspection details.
+
 After confirming that the target PostgreSQL database has the existing
 `businesses`, `users`, and `business_user` tables, review their ID and
 permissions column types and take a verified backup. The migration checks
 these prerequisites and runs product DDL and employee-permission updates in
-one transaction. It creates the `products`, `product_images`, and
-`product_image_cleanup` objects as needed, and adds product and sale-item unit
-columns. Existing records receive the legacy default unit `pieces`. It does
-not drop application tables. Run it explicitly from this directory against
+one transaction. It creates the `products`, `product_images`,
+`product_image_cleanup`, and `pc_inspection_reports` objects as needed, and
+adds product and sale-item unit columns. Existing records receive the legacy
+default unit `pieces`. It does not drop application tables. Run it explicitly
+from this directory against
 the intended database:
 
 ```sh
@@ -63,6 +71,8 @@ The reviewed SQL is also available at
 [`migrations/20261113_products_and_images.sql`](./migrations/20261113_products_and_images.sql).
 Unit support is added by
 [`migrations/20261117_product_units.sql`](./migrations/20261117_product_units.sql).
+PC report history is added by
+[`migrations/20261118_pc_inspection_reports.sql`](./migrations/20261118_pc_inspection_reports.sql).
 This command is not run at startup, during build, or during deployment. For
 production, run it from a trusted environment configured with the production
 database URL only after verifying the URL target and backup. Confirm that it
