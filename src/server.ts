@@ -7,8 +7,10 @@ import { ipKeyGenerator, rateLimit } from 'express-rate-limit'
 import bcrypt from 'bcryptjs'
 import multer from 'multer'
 import nodemailer from 'nodemailer'
-import { type PoolClient } from 'pg'
+import type { PoolClient } from 'pg'
 import { row, rows, transaction } from './db.js'
+import { logError } from './safe-logger.js'
+import { parsePcInspectionDevices, type PcInspectionDevice } from './pc-inspections.js'
 import {
   deleteProductImageObject,
   isProductImageStorageConfigured,
@@ -52,14 +54,14 @@ type Handler = (req: ApiRequest, res: Response, next: NextFunction) => unknown
 const app = express()
 const accessMinutes = Number(process.env.ACCESS_TOKEN_EXPIRATION_MINUTES || 15)
 const refreshDays = Number(process.env.REFRESH_TOKEN_EXPIRATION_DAYS || 7)
+const sessionIdleMinutes = 12 * 60
 const currencies = new Set((process.env.BUSINESS_CURRENCIES || 'TZS,KES,UGX,USD').split(','))
 const frontendUrls = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || 'http://localhost:3000')
   .split(',').map((url) => url.trim()).filter(Boolean)
 
 app.disable('x-powered-by')
-app.set('trust proxy', process.env.VERCEL
-  ? 1
-  : process.env.TRUST_PROXY === 'true' ? 1 : false)
+const isVercel = Boolean(process.env.VERCEL)
+app.set('trust proxy', isVercel ? 1 : process.env.TRUST_PROXY === 'true' ? 1 : false)
 const helmetMiddleware = (helmetModule.default as unknown as
   (options?: helmetModule.HelmetOptions) => RequestHandler)()
 app.use(helmetMiddleware)
@@ -90,11 +92,17 @@ app.get('/api/health', asyncRoute(async (_req, res) => {
   await row('SELECT 1')
   res.json({ status: 'ok', database: 'connected' })
 }))
+
+function clientIpKey(req: Request): string {
+  return ipKeyGenerator(req.ip || req.socket.remoteAddress || '127.0.0.1')
+}
+
 app.use('/api', rateLimit({
   windowMs: 60_000,
   limit: 120,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: clientIpKey,
 }))
 
 function hash(value: string): string {
@@ -117,7 +125,7 @@ function validate(
   const errors: Record<string, string[]> = {}
   for (const [key, rules] of Object.entries(fields)) {
     const value = body[key]
-    const normalized = text(value)
+    const normalized = typeof value === 'number' && Number.isFinite(value) ? String(value) : text(value)
     if (rules.required && (value === undefined || value === null || normalized === '')) {
       errors[key] = [`The ${key.replaceAll('_', ' ')} field is required.`]
     } else if (value !== undefined && value !== null && typeof value !== 'string' && typeof value !== 'number') {
@@ -176,25 +184,23 @@ async function userPayload(user: User): Promise<Record<string, unknown>> {
   }
 }
 
-async function issuePair(user: User, deviceName: string, client?: PoolClient): Promise<Record<string, unknown>> {
+async function issuePair(user: User, deviceName: string): Promise<Record<string, unknown>> {
   const accessToken = randomBytes(48).toString('base64url')
   const refreshToken = randomBytes(60).toString('base64url')
   const accessId = randomUUID()
-  const expiresAt = new Date(Date.now() + accessMinutes * 60_000)
-  const refreshExpiresAt = new Date(Date.now() + refreshDays * 86_400_000)
-  const persistPair = async (transactionClient: PoolClient) => {
-    await transactionClient.query('DELETE FROM api_access_tokens WHERE user_id=$1 AND device_name=$2', [user.id, deviceName])
-    await transactionClient.query(
+  const expiresAt = new Date(Date.now() + Math.min(accessMinutes, sessionIdleMinutes) * 60_000)
+  const refreshExpiresAt = new Date(Date.now() + Math.min(sessionIdleMinutes, refreshDays * 24 * 60) * 60_000)
+  await transaction(async (client) => {
+    await client.query('DELETE FROM api_access_tokens WHERE user_id=$1 AND device_name=$2', [user.id, deviceName])
+    await client.query(
       'INSERT INTO api_access_tokens (id,user_id,token_hash,device_name,expires_at) VALUES ($1,$2,$3,$4,$5)',
       [accessId, user.id, hash(accessToken), deviceName, expiresAt],
     )
-    await transactionClient.query(
+    await client.query(
       'INSERT INTO api_refresh_tokens (access_token_id,user_id,token_hash,device_name,expires_at) VALUES ($1,$2,$3,$4,$5)',
       [accessId, user.id, hash(refreshToken), deviceName, refreshExpiresAt],
     )
-  }
-  if (client) await persistPair(client)
-  else await transaction(persistPair)
+  })
   return {
     token: accessToken, token_type: 'Bearer', expires_at: expiresAt.toISOString(),
     refresh_token: refreshToken, refresh_expires_at: refreshExpiresAt.toISOString(),
@@ -210,6 +216,30 @@ const authenticate: Handler = asyncRoute(async (req, res, next) => {
     [hash(token)],
   )
   if (!user) return fail(res, 401, 'Unauthenticated.')
+  const sessionValid = await transaction(async (client) => {
+    const accessToken = await row<{ id: string }>(
+      'SELECT id FROM api_access_tokens WHERE id=$1 AND expires_at>CURRENT_TIMESTAMP FOR UPDATE',
+      [user.token_id],
+      client,
+    )
+    const refreshToken = await row<{ id: number }>(
+      'SELECT id FROM api_refresh_tokens WHERE access_token_id=$1 AND expires_at>CURRENT_TIMESTAMP FOR UPDATE',
+      [user.token_id],
+      client,
+    )
+    if (!accessToken || !refreshToken) return false
+    await client.query(
+      `UPDATE api_refresh_tokens
+       SET expires_at=LEAST(
+         created_at + ($2 * INTERVAL '1 day'),
+         CURRENT_TIMESTAMP + ($3 * INTERVAL '1 minute')
+       )
+       WHERE access_token_id=$1`,
+      [user.token_id, refreshDays, sessionIdleMinutes],
+    )
+    return true
+  })
+  if (!sessionValid) return fail(res, 401, 'Unauthenticated.')
   req.user = user
   res.locals.tokenId = user.token_id
   return next()
@@ -245,7 +275,11 @@ const businessAccess: Handler = asyncRoute(async (req, res, next) => {
 
 function permission(name: string): Handler {
   return (req, res, next) => {
-    if (req.membership?.role !== 'owner' && !req.membership?.permissions?.includes(name)) {
+    const employeeCanAccessStore = req.membership?.role === 'employee'
+      && ['products.view', 'products.create'].includes(name)
+    const employeeCanManageDebts = req.membership?.role === 'employee'
+      && ['debts.view', 'debts.create'].includes(name)
+    if (req.membership?.role !== 'owner' && !req.membership?.permissions?.includes(name) && !employeeCanAccessStore && !employeeCanManageDebts) {
       return fail(res, 403, 'You do not have permission to perform this action.')
     }
     return next()
@@ -259,67 +293,16 @@ function activeBusinessUsers(business: Business): Promise<number[]> {
 
 const writeLimiter = rateLimit({
   windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false,
-  keyGenerator: (req: Request) => `${ipKeyGenerator(req.ip || '127.0.0.1')}:${req.header('authorization') || 'guest'}`,
+  keyGenerator: clientIpKey,
 })
 
-const loginLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false })
-const refreshLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false })
+const loginLimiter = rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey })
+const refreshLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey })
 const loginFailures = new Map<string, { count: number; lockedUntil: number }>()
-
-app.post('/api/register', writeLimiter, asyncRoute(async (req, res) => {
-  const body = req.body as Record<string, unknown>
-  if (!validate(res, body, {
-    name: { required: true, max: 150 }, business_name: { required: true, max: 150 },
-    phone: { required: true, max: 30 }, email: { required: true, max: 150, email: true },
-    password: { required: true, min: 12 },
-  })) return
-  if (body.password !== body.password_confirmation) {
-    return fail(res, 422, 'The password confirmation does not match.', { password_confirmation: ['The password confirmation does not match.'] })
-  }
-  const email = text(body.email).toLowerCase()
-  const currency = text(body.currency) || 'TZS'
-  if (!currencies.has(currency)) return fail(res, 422, 'The selected currency is invalid.')
-  const registeredPair = await transaction(async (client) => {
-    const existing = await row<User>('SELECT * FROM users WHERE lower(email)=$1', [email], client)
-    if (existing) throw Object.assign(new Error('An account with this email already exists.'), { status: 422 })
-    const user = await row<User>(
-      `INSERT INTO users(name,email,phone,password,is_platform_admin,is_active,created_at,updated_at)
-       VALUES($1,$2,$3,$4,false,true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING *`,
-      [text(body.name), email, text(body.phone), await bcrypt.hash(text(body.password), 12)],
-      client,
-    )
-    if (!user) throw new Error('Account registration returned no user.')
-    const business = await row<Business>(
-      `INSERT INTO businesses(name,business_type,phone,email,address,currency,status,created_by,created_at,updated_at)
-       VALUES($1,NULL,$2,$3,NULL,$4,'active',$5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING *`,
-      [text(body.business_name), text(body.phone), email, currency, user.id],
-      client,
-    )
-    if (!business) throw new Error('Business registration returned no business.')
-    await client.query(
-      'INSERT INTO business_user(business_id,user_id,role,permissions,is_active,created_at,updated_at) VALUES($1,$2,$3,$4,true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
-      [business.id, user.id, 'owner', JSON.stringify([])],
-    )
-    await client.query(
-      `INSERT INTO categories(business_id,name,type,is_active,created_at,updated_at) VALUES
-       ($1,'Other income','income',true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),
-       ($1,'Other expense','expense',true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
-      [business.id],
-    )
-    await client.query(
-      "INSERT INTO payment_methods(business_id,name,is_active,created_at,updated_at) VALUES($1,'Cash',true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-      [business.id],
-    )
-    await audit(business.id, user.id, 'business.registered', 'App\\Models\\Business', business.id, null, { name: business.name }, client)
-    return user
-  })
-  const pair = await issuePair(registeredPair, text(body.device_name) || 'denibook-web')
-  return res.status(201).json({ ...pair, user: await userPayload(registeredPair), message: 'Account and business created successfully.' })
-}))
 
 app.post('/api/login', loginLimiter, asyncRoute(async (req, res) => {
   const body = req.body as Record<string, unknown>
-  if (!validate(res, body, { email: { required: true, max: 150 }, password: { required: true, max: 200 } })) return
+  if (!validate(res, body, { email: { required: true, max: 150, email: true }, password: { required: true, max: 200 } })) return
   const email = text(body.email).toLowerCase()
   const attemptKey = hash(`${email}|${req.ip}`)
   const locked = loginFailures.get(attemptKey)
@@ -331,11 +314,7 @@ app.post('/api/login', loginLimiter, asyncRoute(async (req, res) => {
   if (locked && locked.lockedUntil <= Date.now()) loginFailures.delete(attemptKey)
   const removed = await row('SELECT id FROM users WHERE lower(removed_email)=$1 AND is_active=false', [email])
   if (removed) return fail(res, 403, 'You have been blocked from signing in. Contact your business owner.')
-  const identifier = text(body.identifier) || email
-  const user = await row<User>(
-    'SELECT * FROM users WHERE lower(email)=lower($1) OR phone=$1 ORDER BY id LIMIT 1',
-    [identifier],
-  )
+  const user = await row<User>('SELECT * FROM users WHERE lower(email)=$1', [email])
   if (!user || !user.is_active || !await bcrypt.compare(text(body.password), user.password)) {
     const attempts = loginFailures.get(attemptKey) || { count: 0, lockedUntil: 0 }
     attempts.count += 1
@@ -372,7 +351,7 @@ app.post('/api/login', loginLimiter, asyncRoute(async (req, res) => {
 app.post('/api/token/refresh', refreshLimiter, asyncRoute(async (req, res) => {
   const refreshToken = text(req.body?.refresh_token)
   if (!refreshToken || refreshToken.length > 200) return fail(res, 422, 'The refresh token is required.')
-  const pair = await transaction(async (client) => {
+  const result = await transaction(async (client) => {
     const saved = await row<{ id: number; access_token_id: string; user_id: number; device_name: string; expires_at: Date }>(
       'SELECT * FROM api_refresh_tokens WHERE token_hash=$1 FOR UPDATE', [hash(refreshToken)], client,
     )
@@ -383,12 +362,12 @@ app.post('/api/token/refresh', refreshLimiter, asyncRoute(async (req, res) => {
     if (!user?.is_active) throw Object.assign(new Error('The account is inactive.'), { status: 401 })
     await client.query('DELETE FROM api_refresh_tokens WHERE id=$1', [saved.id])
     await client.query('DELETE FROM api_access_tokens WHERE id=$1', [saved.access_token_id])
-    return issuePair(user, saved.device_name, client)
+    return { user, name: saved.device_name }
   })
-  return res.json(pair)
+  return res.json(await issuePair(result.user, result.name))
 }))
 
-app.post('/api/forgot-password', rateLimit({ windowMs: 3_600_000, limit: 3, standardHeaders: true, legacyHeaders: false }), asyncRoute(async (req, res) => {
+app.post('/api/forgot-password', rateLimit({ windowMs: 3_600_000, limit: 3, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey }), asyncRoute(async (req, res) => {
   const email = text(req.body?.email).toLowerCase()
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 150) return fail(res, 422, 'The email must be a valid email address.')
   const smtpHost = process.env.SMTP_HOST || process.env.MAIL_HOST
@@ -426,7 +405,7 @@ app.post('/api/forgot-password', rateLimit({ windowMs: 3_600_000, limit: 3, stan
   return res.json({ message: 'If the account exists, a password reset link has been sent.' })
 }))
 
-app.post('/api/reset-password', rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false }), asyncRoute(async (req, res) => {
+app.post('/api/reset-password', rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false, keyGenerator: clientIpKey }), asyncRoute(async (req, res) => {
   const { token, email, password, password_confirmation: confirmation } = req.body as Record<string, unknown>
   if (!validate(res, { token, email, password }, {
     token: { required: true }, email: { required: true, max: 150, email: true }, password: { required: true, min: 12 },
@@ -449,17 +428,21 @@ app.post('/api/reset-password', rateLimit({ windowMs: 60_000, limit: 10, standar
 }))
 
 app.get('/api/me', authenticate, asyncRoute(async (req, res) => res.json(await userPayload(req.user!))))
-app.post('/api/session/activity', authenticate, asyncRoute(async (_req, res) => {
-  const expiresAt = new Date(Date.now() + accessMinutes * 60_000)
-  const token = await row<{ id: string }>(
-    'UPDATE api_access_tokens SET expires_at=$1 WHERE id=$2 RETURNING id',
-    [expiresAt, res.locals.tokenId],
-  )
-  if (!token) return fail(res, 401, 'Unauthenticated.')
-  return res.json({ expires_at: expiresAt.toISOString() })
-}))
-app.post('/api/logout', authenticate, asyncRoute(async (_req, res) => {
-  await rows('DELETE FROM api_access_tokens WHERE id=$1', [res.locals.tokenId])
+app.post('/api/session/activity', authenticate, (_req, res) => res.sendStatus(204))
+app.post('/api/logout', asyncRoute(async (req, res) => {
+  const accessToken = req.header('authorization')?.replace(/^Bearer\s+/i, '')
+  const refreshToken = text(req.body?.refresh_token)
+  await transaction(async (client) => {
+    if (refreshToken && refreshToken.length <= 200) {
+      await client.query(
+        'DELETE FROM api_access_tokens WHERE id IN (SELECT access_token_id FROM api_refresh_tokens WHERE token_hash=$1)',
+        [hash(refreshToken)],
+      )
+    }
+    if (accessToken && accessToken.length <= 200) {
+      await client.query('DELETE FROM api_access_tokens WHERE token_hash=$1', [hash(accessToken)])
+    }
+  })
   return res.json({ message: 'Signed out successfully.' })
 }))
 
@@ -474,17 +457,12 @@ admin.get('/businesses', asyncRoute(async (req, res) => {
     `SELECT b.*,COALESCE(json_agg(json_build_object('id',u.id,'name',u.name,'email',u.email))
        FILTER (WHERE u.id IS NOT NULL),'[]'::json) AS users
      FROM businesses b LEFT JOIN business_user m ON m.business_id=b.id AND m.role='owner'
-     LEFT JOIN users u ON u.id=m.user_id WHERE ($1::boolean OR b.deleted_at IS NULL)
-       AND ($2='' OR b.name ILIKE '%'||$2||'%' OR u.name ILIKE '%'||$2||'%' OR u.email ILIKE '%'||$2||'%')
+     LEFT JOIN users u ON u.id=m.user_id WHERE ($1::boolean OR b.deleted_at IS NULL) AND ($2='' OR b.name ILIKE '%'||$2||'%')
      GROUP BY b.id ORDER BY b.created_at DESC LIMIT $3 OFFSET $4`,
     [deletedFilter, search, perPage, (page - 1) * perPage],
   )
   const count = await row<{ count: number }>(
-    `SELECT count(DISTINCT b.id)::int AS count
-     FROM businesses b LEFT JOIN business_user m ON m.business_id=b.id AND m.role='owner'
-     LEFT JOIN users u ON u.id=m.user_id
-     WHERE ($1::boolean OR b.deleted_at IS NULL)
-       AND ($2='' OR b.name ILIKE '%'||$2||'%' OR u.name ILIKE '%'||$2||'%' OR u.email ILIKE '%'||$2||'%')`,
+    "SELECT count(*)::int AS count FROM businesses WHERE ($1::boolean OR deleted_at IS NULL) AND ($2='' OR name ILIKE '%'||$2||'%')",
     [deletedFilter, search],
   )
   return res.json({ data: result, current_page: page, per_page: perPage, total: count?.count || 0, last_page: Math.max(1, Math.ceil((count?.count || 0) / perPage)) })
@@ -510,6 +488,7 @@ admin.post('/businesses', writeLimiter, asyncRoute(async (req, res) => {
     let created = false
     if (!owner) {
       if (text(body.owner_password).length < 12) throw Object.assign(new Error('A password of at least 12 characters is required for a new owner account.'), { status: 422 })
+      if (body.owner_password !== body.owner_password_confirmation) throw Object.assign(new Error('The password confirmation does not match.'), { status: 422 })
       owner = await row<User>(
         `INSERT INTO users (name,email,phone,password,is_platform_admin,is_active,created_at,updated_at)
          VALUES($1,$2,$3,$4,false,true,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING *`,
@@ -557,13 +536,70 @@ admin.patch('/businesses/:id/status', writeLimiter, asyncRoute(async (req, res) 
   return res.json({ message: 'Business status updated.', business: { ...business, status } })
 }))
 admin.delete('/businesses/:id', writeLimiter, asyncRoute(async (req, res) => {
-  const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NULL', [Number(req.params.id)])
-  if (!business) return fail(res, 404, 'Business not found.')
-  await rows('UPDATE businesses SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=$1', [business.id])
-  const userIds = await activeBusinessUsers(business)
-  if (userIds.length) await rows('DELETE FROM api_access_tokens WHERE user_id=ANY($1::bigint[])', [userIds])
-  await audit(business.id, req.user!.id, 'business.deleted', 'App\\Models\\Business', business.id, { deleted_at: null }, { deleted_at: new Date().toISOString() })
-  return res.json({ message: 'Business removed. Its records are preserved.' })
+  if (req.body?.delete_data !== undefined && typeof req.body.delete_data !== 'boolean') return fail(res, 422, 'The delete_data field must be true or false.')
+  const deleteData = req.body?.delete_data === true
+  const businessId = Number(req.params.id)
+  if (!deleteData) {
+    const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NULL', [businessId])
+    if (!business) return fail(res, 404, 'Business not found.')
+    await rows('UPDATE businesses SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=$1', [business.id])
+    const userIds = await activeBusinessUsers(business)
+    if (userIds.length) await rows('DELETE FROM api_access_tokens WHERE user_id=ANY($1::bigint[])', [userIds])
+    await audit(business.id, req.user!.id, 'business.deleted', 'App\\Models\\Business', business.id, { deleted_at: null }, { deleted_at: new Date().toISOString() })
+    return res.json({ message: 'Business removed. Its records are preserved.' })
+  }
+
+  const result = await transaction(async (client) => {
+    const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NULL FOR UPDATE', [businessId], client)
+    if (!business) throw Object.assign(new Error('Business not found.'), { status: 404 })
+    const owners = await rows<{ user_id: number; email: string; is_platform_admin: boolean }>(
+      `SELECT m.user_id,u.email,u.is_platform_admin FROM business_user m JOIN users u ON u.id=m.user_id
+       WHERE m.business_id=$1 AND m.role='owner' FOR UPDATE OF u`,
+      [business.id],
+      client,
+    )
+    const productImages = await rows<{ image_key: string; thumbnail_key: string }>(
+      'SELECT image_key,thumbnail_key FROM product_images WHERE business_id=$1',
+      [business.id],
+      client,
+    )
+    const imageKeys = productImages.flatMap((image) => [image.image_key, image.thumbnail_key])
+    await trackProductImageCleanup(business.id, imageKeys, client)
+    await audit(
+      business.id,
+      req.user!.id,
+      'business.permanently_deleted',
+      'App\\Models\\Business',
+      business.id,
+      { name: business.name },
+      { data_deleted: true },
+      client,
+    )
+    await client.query('DELETE FROM businesses WHERE id=$1', [business.id])
+
+    let ownerAccountsDeleted = 0
+    for (const owner of owners) {
+      const membership = await row<{ count: number }>(
+        'SELECT count(*)::int AS count FROM business_user WHERE user_id=$1',
+        [owner.user_id],
+        client,
+      )
+      if (membership?.count || owner.is_platform_admin) continue
+      await client.query('DELETE FROM api_access_tokens WHERE user_id=$1', [owner.user_id])
+      await client.query('DELETE FROM api_refresh_tokens WHERE user_id=$1', [owner.user_id])
+      await client.query('DELETE FROM api_password_resets WHERE lower(email)=lower($1)', [owner.email])
+      await client.query('DELETE FROM users WHERE id=$1', [owner.user_id])
+      ownerAccountsDeleted += 1
+    }
+    return { ownerAccountsDeleted }
+  })
+
+  const cleanupPending = await retryPendingProductImageCleanup(businessId)
+  return res.json({
+    message: 'Business and its data were permanently deleted.',
+    owner_accounts_deleted: result.ownerAccountsDeleted,
+    image_cleanup_pending: cleanupPending,
+  })
 }))
 admin.post('/businesses/:id/restore', writeLimiter, asyncRoute(async (req, res) => {
   const business = await row<Business>('SELECT * FROM businesses WHERE id=$1 AND deleted_at IS NOT NULL', [Number(req.params.id)])
@@ -641,6 +677,7 @@ type ProductValues = {
   cost_price: string | null
   sku: string | null
   category: string
+  unit: string
   stock_quantity: string
 }
 
@@ -701,18 +738,28 @@ function productValues(body: Record<string, unknown>, res: Response): ProductVal
     cost_price: {},
     sku: { max: 100 },
     category: { required: true, max: 100 },
+    unit: { max: 40 },
     stock_quantity: { required: true },
   })) return null
 
+  if (body.unit !== undefined && body.unit !== null && typeof body.unit !== 'string') {
+    return fail(res, 422, 'Unit must be text.'), null
+  }
   const numericText = (value: unknown) => (
     typeof value === 'number' && Number.isFinite(value) ? String(value) : text(value)
   )
   const sellingPrice = numericText(body.selling_price)
   const costPrice = numericText(body.cost_price)
   const stockQuantity = numericText(body.stock_quantity)
+  const requestedUnit = text(body.unit)
+  if (body.unit !== undefined && body.unit !== null && !requestedUnit) {
+    return fail(res, 422, 'Unit cannot be empty.'), null
+  }
+  const unit = requestedUnit || 'pieces'
   if (!/^\d{1,10}(\.\d{1,2})?$/.test(sellingPrice)) return fail(res, 422, 'Selling price must be a non-negative amount with up to 2 decimal places.'), null
   if (costPrice && !/^\d{1,10}(\.\d{1,2})?$/.test(costPrice)) return fail(res, 422, 'Cost price must be a non-negative amount with up to 2 decimal places.'), null
   if (!/^\d{1,9}(\.\d{1,3})?$/.test(stockQuantity)) return fail(res, 422, 'Stock quantity must be non-negative with up to 3 decimal places.'), null
+  if (unit.length > 40) return fail(res, 422, 'Unit must not be greater than 40 characters.'), null
 
   return {
     name: text(body.name),
@@ -721,6 +768,7 @@ function productValues(body: Record<string, unknown>, res: Response): ProductVal
     cost_price: costPrice || null,
     sku: text(body.sku) || null,
     category: text(body.category),
+    unit,
     stock_quantity: stockQuantity,
   }
 }
@@ -755,13 +803,14 @@ async function optimizeUploadedProductImages(files: Express.Multer.File[]) {
   return images
 }
 
-async function trackProductImageCleanup(businessId: number, objectKeys: string[]): Promise<void> {
+async function trackProductImageCleanup(businessId: number, objectKeys: string[], client?: PoolClient): Promise<void> {
   if (!objectKeys.length) return
   await rows(
     `INSERT INTO product_image_cleanup(object_key,business_id)
      SELECT pending.object_key,$1 FROM unnest($2::text[]) AS pending(object_key)
      ON CONFLICT (object_key) DO NOTHING`,
     [businessId, objectKeys],
+    client,
   )
 }
 
@@ -773,19 +822,19 @@ async function cleanupUploadedProductImages(businessId: number, objectKeys: stri
       await deleteProductImageObject(objectKey)
     } catch (error) {
       failedKeys.push(objectKey)
-      console.error(`Unable to roll back product image object for business ${businessId}:`, error)
+      logError('products.image.rollback', error)
     }
   }
   if (failedKeys.length) {
     try {
       await trackProductImageCleanup(businessId, failedKeys)
     } catch (error) {
-      console.error(`Unable to queue product image cleanup for business ${businessId}:`, error)
+      logError('products.image.cleanup_queue', error)
     }
   }
 }
 
-async function retryPendingProductImageCleanup(businessId: number): Promise<number | null> {
+async function retryPendingProductImageCleanup(businessId: number): Promise<number> {
   let deletedImages: ProductImageRow[]
   try {
     deletedImages = await rows<ProductImageRow>(
@@ -794,8 +843,8 @@ async function retryPendingProductImageCleanup(businessId: number): Promise<numb
       [businessId],
     )
   } catch (error) {
-    console.error(`Unable to load pending product image cleanup for business ${businessId}:`, error)
-    return null
+    logError('products.image.cleanup_list', error)
+    return 0
   }
 
   if (isProductImageStorageConfigured()) {
@@ -805,26 +854,26 @@ async function retryPendingProductImageCleanup(businessId: number): Promise<numb
         await deleteProductImageObject(image.thumbnail_key)
         await rows('DELETE FROM product_images WHERE id=$1 AND business_id=$2 AND deleted_at IS NOT NULL', [image.id, businessId])
       } catch (error) {
-        console.error(`Product image cleanup is pending for business ${businessId}, image ${image.id}:`, error)
+        logError('products.image.cleanup_pending', error)
       }
     }
 
     let orphanedObjects: { object_key: string }[]
     try {
       orphanedObjects = await rows<{ object_key: string }>(
-        'SELECT object_key FROM product_image_cleanup WHERE business_id=$1 ORDER BY created_at LIMIT 20',
+        'SELECT object_key FROM product_image_cleanup WHERE business_id=$1 OR business_id IS NULL ORDER BY created_at LIMIT 20',
         [businessId],
       )
     } catch (error) {
-      console.error(`Unable to load orphaned product image cleanup for business ${businessId}:`, error)
-      orphanedObjects = []
+      logError('products.image.orphan_cleanup_list', error)
+      return 0
     }
     for (const object of orphanedObjects) {
       try {
         await deleteProductImageObject(object.object_key)
-        await rows('DELETE FROM product_image_cleanup WHERE business_id=$1 AND object_key=$2', [businessId, object.object_key])
+        await rows('DELETE FROM product_image_cleanup WHERE object_key=$1', [object.object_key])
       } catch (error) {
-        console.error(`Orphaned product image cleanup is pending for business ${businessId}:`, error)
+        logError('products.image.orphan_cleanup_pending', error)
       }
     }
   }
@@ -833,14 +882,14 @@ async function retryPendingProductImageCleanup(businessId: number): Promise<numb
     const pending = await row<{ count: number }>(
       `SELECT (
          (SELECT count(*) FROM product_images WHERE business_id=$1 AND deleted_at IS NOT NULL)
-         + (SELECT count(*) FROM product_image_cleanup WHERE business_id=$1)
+         + (SELECT count(*) FROM product_image_cleanup WHERE business_id=$1 OR business_id IS NULL)
        )::int AS count`,
       [businessId],
     )
-    return pending?.count ?? 0
+    return pending?.count || 0
   } catch (error) {
-    console.error(`Unable to count pending product image cleanup for business ${businessId}:`, error)
-    return null
+    logError('products.image.cleanup_count', error)
+    return 0
   }
 }
 
@@ -871,8 +920,80 @@ async function productImagesFor(businessId: number, productIds: number[]): Promi
 }
 
 function productFields(body: ProductValues): unknown[] {
-  return [body.name, body.description, body.selling_price, body.cost_price, body.sku, body.category, body.stock_quantity]
+  return [body.name, body.description, body.selling_price, body.cost_price, body.sku, body.category, body.unit, body.stock_quantity]
 }
+
+type PcInspectionReportRow = {
+  id: number
+  business_name: string
+  prepared_by_name: string
+  device_count: number
+  devices: PcInspectionDevice[]
+  created_at: Date
+}
+
+business.get('/pc-inspection-reports', permission('products.view'), asyncRoute(async (req, res) => {
+  const { page, perPage, offset } = pageOptions(req)
+  const reports = await rows<Omit<PcInspectionReportRow, 'devices'>>(
+    `SELECT id,business_name,prepared_by_name,device_count,created_at
+     FROM pc_inspection_reports WHERE business_id=$1
+     ORDER BY created_at DESC,id DESC LIMIT $2 OFFSET $3`,
+    [req.business!.id, perPage, offset],
+  )
+  const total = (await row<{ count: number }>(
+    'SELECT count(*)::int AS count FROM pc_inspection_reports WHERE business_id=$1',
+    [req.business!.id],
+  ))?.count || 0
+  const meta = { current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total }
+  return res.json({ data: reports, meta, ...meta })
+}))
+
+business.get('/pc-inspection-reports/:report', permission('products.view'), asyncRoute(async (req, res) => {
+  const reportId = Number(req.params.report)
+  if (!Number.isSafeInteger(reportId) || reportId <= 0) return fail(res, 404, 'PC inspection report not found.')
+  const report = await row<PcInspectionReportRow>(
+    `SELECT id,business_name,prepared_by_name,device_count,devices,created_at
+     FROM pc_inspection_reports WHERE id=$1 AND business_id=$2`,
+    [reportId, req.business!.id],
+  )
+  if (!report) return fail(res, 404, 'PC inspection report not found.')
+  return res.json({ data: report })
+}))
+
+business.post('/pc-inspection-reports', permission('products.create'), writeLimiter, asyncRoute(async (req, res) => {
+  const parsed = parsePcInspectionDevices(req.body?.devices)
+  if (!parsed.ok) return fail(res, 422, parsed.error)
+  const report = await transaction(async (client) => {
+    const saved = await row<PcInspectionReportRow>(
+      `INSERT INTO pc_inspection_reports
+       (business_id,created_by,business_name,prepared_by_name,device_count,devices)
+       VALUES($1,$2,$3,$4,$5,$6::jsonb)
+       RETURNING id,business_name,prepared_by_name,device_count,devices,created_at`,
+      [
+        req.business!.id,
+        req.user!.id,
+        req.business!.name,
+        req.user!.name,
+        parsed.devices.length,
+        JSON.stringify(parsed.devices),
+      ],
+      client,
+    )
+    if (!saved) throw new Error('PC inspection report insert did not return a row.')
+    await audit(
+      req.business!.id,
+      req.user!.id,
+      'pc_inspection_report.created',
+      'PcInspectionReport',
+      saved.id,
+      null,
+      { device_count: saved.device_count },
+      client,
+    )
+    return saved
+  })
+  return res.status(201).json({ data: report })
+}))
 
 business.get('/products', permission('products.view'), asyncRoute(async (req, res) => {
   const businessId = req.business!.id
@@ -895,22 +1016,26 @@ business.get('/products', permission('products.view'), asyncRoute(async (req, re
     `SELECT count(*)::int AS count FROM products p WHERE ${filter}`,
     [businessId, search, category, stockStatus],
   ))?.count || 0
-  const categories = await rows<{ category: string }>(
-    'SELECT DISTINCT category FROM products WHERE business_id=$1 AND deleted_at IS NULL ORDER BY category',
+  const categoryStock = await rows<{ category: string; unit: string; product_count: number; remaining_quantity: string }>(
+    `SELECT category,unit,count(*)::int AS product_count,COALESCE(sum(stock_quantity),0)::text AS remaining_quantity
+     FROM products WHERE business_id=$1 AND deleted_at IS NULL GROUP BY category,unit ORDER BY category,unit`,
     [businessId],
   )
   const images = await productImagesFor(businessId, products.map((product) => product.id))
   const data = products.map((product) => ({ ...product, images: images.get(product.id) || [] }))
   const meta = { current_page: page, per_page: perPage, last_page: Math.max(1, Math.ceil(total / perPage)), total }
-  return res.json({ data, categories: categories.map((item) => item.category), meta, ...meta })
+  return res.json({
+    data,
+    categories: [...new Set(categoryStock.map((item) => item.category))],
+    category_stock: categoryStock,
+    meta,
+    ...meta,
+  })
 }))
 
 business.post('/products', permission('products.create'), writeLimiter, parseProductImages, asyncRoute(async (req, res) => {
   const input = productValues(req.body as Record<string, unknown>, res)
   if (!input) return
-  if (!input.sku) {
-    input.sku = `SKU-${req.business!.id}-${Date.now().toString(36).toUpperCase()}`
-  }
   const files = uploadedProductFiles(req)
   const optimizedImages = await optimizeUploadedProductImages(files)
   if (optimizedImages.length && !isProductImageStorageConfigured()) return fail(res, 503, 'Product image storage is not configured.')
@@ -920,8 +1045,8 @@ business.post('/products', permission('products.create'), writeLimiter, parsePro
   try {
     product = await transaction(async (client) => {
       const saved = await row<ProductRow>(
-        `INSERT INTO products(business_id,name,description,selling_price,cost_price,sku,category,stock_quantity,created_by,updated_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING *`,
+        `INSERT INTO products(business_id,name,description,selling_price,cost_price,sku,category,unit,stock_quantity,created_by,updated_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10) RETURNING *`,
         [req.business!.id, ...productFields(input), req.user!.id],
         client,
       )
@@ -974,6 +1099,9 @@ business.patch('/products/:product', permission('products.edit'), writeLimiter, 
         client,
       )
       if (!current) throw Object.assign(new Error('Product not found.'), { status: 404 })
+      if (req.body.unit === undefined || req.body.unit === null) {
+        input.unit = current.unit
+      }
 
       const currentImages = await rows<ProductImageRow>(
         'SELECT * FROM product_images WHERE product_id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
@@ -990,9 +1118,9 @@ business.patch('/products/:product', permission('products.edit'), writeLimiter, 
       }
 
       const updated = await row<ProductRow>(
-        `UPDATE products SET name=$1,description=$2,selling_price=$3,cost_price=$4,sku=$5,category=$6,stock_quantity=$7,
-         updated_by=$8,updated_at=CURRENT_TIMESTAMP
-         WHERE id=$9 AND business_id=$10 AND deleted_at IS NULL RETURNING *`,
+        `UPDATE products SET name=$1,description=$2,selling_price=$3,cost_price=$4,sku=$5,category=$6,unit=$7,stock_quantity=$8,
+         updated_by=$9,updated_at=CURRENT_TIMESTAMP
+         WHERE id=$10 AND business_id=$11 AND deleted_at IS NULL RETURNING *`,
         [...productFields(input), req.user!.id, productId, req.business!.id],
         client,
       )
@@ -1077,7 +1205,7 @@ business.get('/dashboard', permission('dashboard.view'), asyncRoute(async (req, 
   const id = req.business!.id
   const from = text(req.query.from) || '0001-01-01'
   const to = text(req.query.to) || '9999-12-31'
-  const [totals, balances, stock, bestSellers, recentPayments, recent, costOfGoods] = await Promise.all([
+  const [totals, balances, recent] = await Promise.all([
     row<Record<string, string>>(
       `SELECT
       COALESCE((SELECT sum(total_amount) FROM sales WHERE business_id=$1 AND voided_at IS NULL AND sale_date BETWEEN $2 AND $3),0)::text AS sales_total,
@@ -1099,29 +1227,6 @@ business.get('/dashboard', permission('dashboard.view'), asyncRoute(async (req, 
         WHERE l.business_id=$1 AND l.loan_date BETWEEN $2 AND $3 AND l.principal>COALESCE(r.paid,0)),0)::text AS loan_balance`,
       [id, from, to],
     ),
-    row<{ available_items: string; low_stock_count: number; out_of_stock_count: number }>(
-      `SELECT
-       COALESCE(sum(stock_quantity),0)::text AS available_items,
-       count(*) FILTER (WHERE stock_quantity>0 AND stock_quantity<=5)::int AS low_stock_count,
-       count(*) FILTER (WHERE stock_quantity=0)::int AS out_of_stock_count
-       FROM products WHERE business_id=$1 AND deleted_at IS NULL`,
-      [id],
-    ),
-    rows(
-      `SELECT i.item_name AS name,COALESCE(sum(i.quantity),0)::text AS quantity,
-       COALESCE(sum(i.line_total),0)::text AS total
-       FROM sale_items i JOIN sales s ON s.id=i.sale_id
-       WHERE i.business_id=$1 AND s.voided_at IS NULL AND s.sale_date BETWEEN $2 AND $3
-       GROUP BY i.item_name ORDER BY sum(i.quantity) DESC,sum(i.line_total) DESC LIMIT 5`,
-      [id, from, to],
-    ),
-    rows(
-      `SELECT p.id,p.amount,p.payment_method,p.payment_date,p.reference,c.name AS customer_name
-       FROM sale_payments p LEFT JOIN sales s ON s.id=p.sale_id LEFT JOIN customers c ON c.id=s.customer_id
-       WHERE p.business_id=$1 AND p.voided_at IS NULL AND p.payment_date BETWEEN $2 AND $3
-       ORDER BY p.payment_date DESC,p.id DESC LIMIT 8`,
-      [id, from, to],
-    ),
     rows(
       `SELECT s.*, c.name AS customer_name,
        COALESCE((SELECT json_agg(i) FROM sale_items i WHERE i.sale_id=s.id),'[]'::json) AS items
@@ -1129,26 +1234,12 @@ business.get('/dashboard', permission('dashboard.view'), asyncRoute(async (req, 
      WHERE s.business_id=$1 AND s.voided_at IS NULL ORDER BY s.sale_date DESC,s.id DESC LIMIT 8`,
       [id],
     ),
-    row<{ cost_total: string }>(
-      `SELECT COALESCE(sum(i.quantity*COALESCE(p.cost_price,0)),0)::text AS cost_total
-       FROM sale_items i
-       JOIN sales s ON s.id=i.sale_id
-       LEFT JOIN products p ON p.business_id=i.business_id AND lower(p.name)=lower(i.item_name) AND p.deleted_at IS NULL
-       WHERE i.business_id=$1 AND s.voided_at IS NULL AND s.sale_date BETWEEN $2 AND $3`,
-      [id, from, to],
-    ),
   ])
   return res.json({
     sales_total: totals?.sales_total || '0.00', income_total: totals?.income_total || '0.00',
     expenses_total: totals?.expenses_total || '0.00', payments_total: totals?.payments_total || '0.00',
     outstanding_total: (Number(balances?.sales_balance || 0) + Number(balances?.loan_balance || 0)).toFixed(2),
     debt_count: Number(totals?.debt_count || 0),
-    available_items: stock?.available_items || '0',
-    low_stock_count: Number(stock?.low_stock_count || 0),
-    out_of_stock_count: Number(stock?.out_of_stock_count || 0),
-    profit: (Number(totals?.sales_total || 0) - Number(costOfGoods?.cost_total || 0) - Number(totals?.expenses_total || 0)).toFixed(2),
-    recent_payments: recentPayments,
-    best_sellers: bestSellers,
     recent_activity: recent.map((sale) => ({ ...sale, customer: sale.customer_name ? { name: sale.customer_name } : null, type: 'sale' })),
   })
 }))
@@ -1278,24 +1369,84 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
   if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 100) return fail(res, 422, 'At least one sale item is required.')
   const items = body.items as Record<string, unknown>[]
   let total = 0
-  const normalized: { name: string; quantity: string; price: string; line: string }[] = []
+  const normalized: {
+    name: string
+    quantity: string
+    price: string
+    line: string
+    productId: number | null
+    unit: string
+    unitWasProvided: boolean
+  }[] = []
   for (const item of items) {
     const quantity = Number(item.quantity)
     const price = Number(item.unit_price)
-    if (!text(item.item_name) || text(item.item_name).length > 180 || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price < 0) return fail(res, 422, 'Each item needs a name, positive quantity, and non-negative unit price.')
+    if (!text(item.item_name) || text(item.item_name).length > 180 || !Number.isFinite(quantity) || quantity <= 0 || !/^\d{1,9}(\.\d{1,3})?$/.test(String(item.quantity)) || !Number.isFinite(price) || price < 0 || !/^\d{1,10}(\.\d{1,2})?$/.test(String(item.unit_price))) return fail(res, 422, 'Each item needs a name, a positive quantity with up to 3 decimal places, and a non-negative unit price with up to 2 decimal places.')
+    if (item.unit !== undefined && item.unit !== null && typeof item.unit !== 'string') return fail(res, 422, 'Each item unit must be text.')
+    const requestedUnit = text(item.unit)
+    if (item.unit !== undefined && item.unit !== null && !requestedUnit) return fail(res, 422, 'Each item unit cannot be empty.')
+    if (requestedUnit.length > 40) return fail(res, 422, 'Each item unit must not be greater than 40 characters.')
+    const productId = item.product_id === undefined || item.product_id === null || item.product_id === ''
+      ? null
+      : Number(item.product_id)
+    if (productId !== null && (!Number.isSafeInteger(productId) || productId <= 0)) return fail(res, 422, 'The selected stock product is invalid.')
     const line = Math.round(quantity * price * 100) / 100
     total += line
-    normalized.push({ name: text(item.item_name), quantity: quantity.toFixed(3), price: price.toFixed(2), line: line.toFixed(2) })
+    normalized.push({
+      name: text(item.item_name),
+      quantity: quantity.toFixed(3),
+      price: price.toFixed(2),
+      line: line.toFixed(2),
+      productId,
+      unit: requestedUnit || 'pieces',
+      unitWasProvided: Boolean(requestedUnit),
+    })
   }
   if (total > 999999999999.99) return fail(res, 422, 'The sale total exceeds the supported amount.')
+  const customerName = text(body.customer_name)
+  if (customerName.length > 150) return fail(res, 422, 'The customer name must not be greater than 150 characters.')
+  if (!body.is_completed && normalized.some((item) => item.productId !== null) && !customerName) {
+    return fail(res, 422, 'A customer name is required for a product sold on credit.')
+  }
   const result = await transaction(async (client) => {
+    const stockProducts = new Map<number, { name: string; unit: string; stock_quantity: string }>()
+    const requestedStock = new Map<number, number>()
+    for (const item of normalized) {
+      if (item.productId === null) continue
+      requestedStock.set(item.productId, (requestedStock.get(item.productId) || 0) + Number(item.quantity))
+      if (stockProducts.has(item.productId)) continue
+      const product = await row<{ id: number; name: string; unit: string; stock_quantity: string }>(
+        'SELECT id,name,unit,stock_quantity FROM products WHERE id=$1 AND business_id=$2 AND deleted_at IS NULL FOR UPDATE',
+        [item.productId, req.business!.id],
+        client,
+      )
+      if (!product) throw Object.assign(new Error('The selected stock product was not found.'), { status: 422 })
+      stockProducts.set(item.productId, product)
+    }
+    for (const [productId, quantity] of requestedStock) {
+      const product = stockProducts.get(productId)!
+      if (quantity > Number(product.stock_quantity)) {
+        throw Object.assign(new Error(`Not enough stock for ${product.name}.`), { status: 422 })
+      }
+    }
+    for (const item of normalized) {
+      if (item.productId !== null) {
+        const product = stockProducts.get(item.productId)!
+        if (item.unitWasProvided && item.unit.toLowerCase() !== product.unit.toLowerCase()) {
+          throw Object.assign(new Error(`The sale unit for ${product.name} must match its stock unit (${product.unit}).`), { status: 422 })
+        }
+        item.name = product.name
+        item.unit = product.unit
+      }
+    }
+
     let customerId = body.customer_id ? Number(body.customer_id) : null
     if (customerId && !await row('SELECT id FROM customers WHERE id=$1 AND business_id=$2', [customerId, req.business!.id], client)) {
       throw Object.assign(new Error('The selected customer is invalid.'), { status: 422 })
     }
-    if (!customerId && text(body.customer_name)) {
-      let customer = await row<{ id: number }>('SELECT id FROM customers WHERE business_id=$1 AND lower(name)=lower($2) LIMIT 1', [req.business!.id, text(body.customer_name)], client)
-      if (!customer) customer = await row<{ id: number }>('INSERT INTO customers(business_id,name,created_at,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id', [req.business!.id, text(body.customer_name)], client)
+    if (!customerId && customerName) {
+      let customer = await row<{ id: number }>('SELECT id FROM customers WHERE business_id=$1 AND lower(name)=lower($2) LIMIT 1', [req.business!.id, customerName], client)
+      if (!customer) customer = await row<{ id: number }>('INSERT INTO customers(business_id,name,created_at,updated_at) VALUES($1,$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) RETURNING id', [req.business!.id, customerName], client)
       customerId = customer!.id
     }
     const latest = await row<{ count: number }>('SELECT count(*)::int AS count FROM sales WHERE business_id=$1', [req.business!.id], client)
@@ -1308,22 +1459,13 @@ business.post('/sales', permission('sales.create'), writeLimiter, asyncRoute(asy
     )
     for (const item of normalized) {
       await client.query(
-        'INSERT INTO sale_items(business_id,sale_id,item_name,quantity,unit_price,line_total,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
-        [req.business!.id, sale!.id, item.name, item.quantity, item.price, item.line],
+        'INSERT INTO sale_items(business_id,sale_id,product_id,item_name,quantity,unit,unit_price,line_total,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)',
+        [req.business!.id, sale!.id, item.productId, item.name, item.quantity, item.unit, item.price, item.line],
       )
-      const product = await row<{ id: number; stock_quantity: string }>(
-        'SELECT id,stock_quantity FROM products WHERE business_id=$1 AND lower(name)=lower($2) AND deleted_at IS NULL FOR UPDATE',
-        [req.business!.id, item.name],
-        client,
-      )
-      if (product) {
-        const remaining = Number(product.stock_quantity) - Number(item.quantity)
-        if (remaining < 0) {
-          throw Object.assign(new Error(`Insufficient stock for ${item.name}.`), { status: 422 })
-        }
+      if (item.productId !== null) {
         await client.query(
-          'UPDATE products SET stock_quantity=$1,updated_by=$2,updated_at=CURRENT_TIMESTAMP WHERE id=$3',
-          [remaining.toFixed(3), req.user!.id, product.id],
+          'UPDATE products SET stock_quantity=stock_quantity-$1,updated_by=$2,updated_at=CURRENT_TIMESTAMP WHERE id=$3 AND business_id=$4',
+          [item.quantity, req.user!.id, item.productId, req.business!.id],
         )
       }
     }
@@ -1408,7 +1550,7 @@ business.get('/employees', permission('employees.view'), asyncRoute(async (req, 
   return res.json(employees.map((employee) => ({
     ...employee,
     email: employee.is_active ? employee.email : null,
-    restore_email: employee.is_active ? null : employee.removed_email,
+    restore_email: employee.is_active ? null : employee.removed_email || employee.email,
     permissions: employee.permissions || [],
   })))
 }))
@@ -1484,18 +1626,138 @@ business.patch('/employees/:employee', permission('employees.manage'), writeLimi
   }
   return fail(res, 422, 'The is_active field must be true or false.')
 }))
+async function deleteEmployeeBusinessData(businessId: number, userId: number, client: PoolClient): Promise<string[]> {
+  const sales = await rows<{ id: number }>(
+    'SELECT id FROM sales WHERE business_id=$1 AND created_by=$2 FOR UPDATE',
+    [businessId, userId],
+    client,
+  )
+  const saleIds = sales.map((sale) => sale.id)
+  const paymentSales = await rows<{ id: number }>(
+    `SELECT DISTINCT sale_id AS id FROM sale_payments
+     WHERE business_id=$1 AND received_by=$2 AND NOT (sale_id=ANY($3::bigint[]))`,
+    [businessId, userId, saleIds],
+    client,
+  )
+  const affectedSaleIds = paymentSales.map((sale) => sale.id)
+  await client.query(
+    'DELETE FROM sale_payments WHERE business_id=$1 AND (received_by=$2 OR sale_id=ANY($3::bigint[]))',
+    [businessId, userId, saleIds],
+  )
+  if (saleIds.length) {
+    await client.query('DELETE FROM sale_items WHERE business_id=$1 AND sale_id=ANY($2::bigint[])', [businessId, saleIds])
+    await client.query('DELETE FROM sales WHERE business_id=$1 AND id=ANY($2::bigint[])', [businessId, saleIds])
+  }
+  if (affectedSaleIds.length) {
+    await client.query(
+      `UPDATE sales s SET status=CASE
+         WHEN COALESCE((SELECT sum(p.amount) FROM sale_payments p WHERE p.sale_id=s.id AND p.voided_at IS NULL),0)>=s.total_amount THEN 'paid'
+         WHEN COALESCE((SELECT sum(p.amount) FROM sale_payments p WHERE p.sale_id=s.id AND p.voided_at IS NULL),0)>0 THEN 'partial'
+         ELSE 'unpaid' END,
+         updated_at=CURRENT_TIMESTAMP
+       WHERE s.business_id=$1 AND s.id=ANY($2::bigint[])`,
+      [businessId, affectedSaleIds],
+    )
+  }
+
+  await client.query(
+    `DELETE FROM business_loan_repayments
+     WHERE business_id=$1 AND (received_by=$2 OR business_loan_id IN (
+       SELECT id FROM business_loans WHERE business_id=$1 AND created_by=$2
+     ))`,
+    [businessId, userId],
+  )
+  await client.query('DELETE FROM business_loans WHERE business_id=$1 AND created_by=$2', [businessId, userId])
+  await client.query('DELETE FROM income_records WHERE business_id=$1 AND created_by=$2', [businessId, userId])
+  await client.query('DELETE FROM expenses WHERE business_id=$1 AND created_by=$2', [businessId, userId])
+  await client.query('DELETE FROM business_messages WHERE business_id=$1 AND (sender_id=$2 OR recipient_id=$2)', [businessId, userId])
+
+  const products = await rows<{ id: number }>(
+    'SELECT id FROM products WHERE business_id=$1 AND created_by=$2 FOR UPDATE',
+    [businessId, userId],
+    client,
+  )
+  const productIds = products.map((product) => product.id)
+  if (!productIds.length) return []
+  const images = await rows<{ image_key: string; thumbnail_key: string }>(
+    'SELECT image_key,thumbnail_key FROM product_images WHERE business_id=$1 AND product_id=ANY($2::bigint[])',
+    [businessId, productIds],
+    client,
+  )
+  await client.query('DELETE FROM products WHERE business_id=$1 AND id=ANY($2::bigint[])', [businessId, productIds])
+  return images.flatMap((image) => [image.image_key, image.thumbnail_key])
+}
+
 business.delete('/employees/:employee', permission('employees.manage'), asyncRoute(async (req, res) => {
   if (req.membership?.role !== 'owner') return fail(res, 403, 'Only the business owner can remove employees.')
+  if (req.body?.delete_data !== undefined && typeof req.body.delete_data !== 'boolean') return fail(res, 422, 'The delete_data field must be true or false.')
+  const deleteData = req.body?.delete_data === true
   const employeeId = Number(req.params.employee)
-  const result = await rows(
-    `UPDATE business_user SET is_active=false,updated_at=CURRENT_TIMESTAMP
-     WHERE business_id=$1 AND user_id=$2 AND role='employee' RETURNING user_id`,
-    [req.business!.id, employeeId],
-  )
-  if (!result.length) return fail(res, 404, 'Employee not found.')
-  await rows('DELETE FROM api_access_tokens WHERE user_id=$1', [employeeId])
-  await rows('DELETE FROM api_refresh_tokens WHERE user_id=$1', [employeeId])
-  return res.json({ message: 'Employee removed.' })
+  const result = await transaction(async (client) => {
+    const employee = await row<{ user_id: number; email: string }>(
+      `SELECT m.user_id,u.email FROM business_user m JOIN users u ON u.id=m.user_id
+       WHERE m.business_id=$1 AND m.user_id=$2 AND m.role='employee' FOR UPDATE OF m,u`,
+      [req.business!.id, employeeId],
+      client,
+    )
+    if (!employee) throw Object.assign(new Error('Employee not found.'), { status: 404 })
+
+    const productImageKeys = deleteData
+      ? await deleteEmployeeBusinessData(req.business!.id, employee.user_id, client)
+      : []
+    await audit(
+      req.business!.id,
+      req.user!.id,
+      deleteData ? 'employee.removed_data_deleted' : 'employee.removed',
+      'App\\Models\\User',
+      employee.user_id,
+      { is_active: true },
+      { is_active: false, business_data_deleted: deleteData },
+      client,
+    )
+
+    const otherMemberships = await row<{ count: number }>(
+      'SELECT count(*)::int AS count FROM business_user WHERE user_id=$1 AND business_id<>$2',
+      [employee.user_id, req.business!.id],
+      client,
+    )
+    if (deleteData && !otherMemberships?.count) {
+      await client.query('DELETE FROM api_access_tokens WHERE user_id=$1', [employee.user_id])
+      await client.query('DELETE FROM api_refresh_tokens WHERE user_id=$1', [employee.user_id])
+      await client.query('DELETE FROM api_password_resets WHERE lower(email)=lower($1)', [employee.email])
+      await client.query('DELETE FROM business_user WHERE business_id=$1 AND user_id=$2', [req.business!.id, employee.user_id])
+      await client.query('DELETE FROM users WHERE id=$1', [employee.user_id])
+      return { productImageKeys, accountDeleted: true }
+    }
+
+    await client.query(
+      'UPDATE business_user SET is_active=false,updated_at=CURRENT_TIMESTAMP WHERE business_id=$1 AND user_id=$2',
+      [req.business!.id, employee.user_id],
+    )
+    const activeMemberships = await row<{ count: number }>(
+      'SELECT count(*)::int AS count FROM business_user WHERE user_id=$1 AND is_active=true',
+      [employee.user_id],
+      client,
+    )
+    if (!activeMemberships?.count) {
+      await client.query(
+        `UPDATE users SET removed_email=COALESCE(removed_email,email),email='removed-'||id||'@account.invalid',
+         password=$1,is_active=false,remember_token=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=$2`,
+        [await bcrypt.hash(randomBytes(48).toString('hex'), 12), employee.user_id],
+      )
+      await client.query('DELETE FROM api_access_tokens WHERE user_id=$1', [employee.user_id])
+      await client.query('DELETE FROM api_refresh_tokens WHERE user_id=$1', [employee.user_id])
+    }
+    return { productImageKeys, accountDeleted: false }
+  })
+  await cleanupUploadedProductImages(req.business!.id, result.productImageKeys)
+  return res.json({
+    message: deleteData
+      ? result.accountDeleted
+        ? 'Employee records and account were permanently deleted.'
+        : 'Employee records were permanently deleted from this business. The account remains for other business memberships.'
+      : 'Employee access was removed. Existing records were preserved.',
+  })
 }))
 
 business.get('/inbox', asyncRoute(async (req, res) => {
@@ -1563,7 +1825,9 @@ business.get('/debts', permission('debts.view'), asyncRoute(async (req, res) => 
   )
   const sales = await rows(
     `SELECT s.*,c.name AS borrower_name,c.phone AS borrower_phone,
-       COALESCE(sum(p.amount),0)::text AS paid_amount,(s.total_amount-COALESCE(sum(p.amount),0))::text AS balance
+       COALESCE(sum(p.amount),0)::text AS paid_amount,(s.total_amount-COALESCE(sum(p.amount),0))::text AS balance,
+       COALESCE((SELECT json_agg(json_build_object('item_name',i.item_name,'quantity',i.quantity,'unit',i.unit))
+         FROM sale_items i WHERE i.sale_id=s.id),'[]'::json) AS items
      FROM sales s LEFT JOIN customers c ON c.id=s.customer_id
      LEFT JOIN sale_payments p ON p.sale_id=s.id AND p.voided_at IS NULL
      WHERE s.business_id=$1 AND s.voided_at IS NULL GROUP BY s.id,c.name,c.phone ORDER BY s.sale_date DESC`,
@@ -1574,7 +1838,7 @@ business.get('/debts', permission('debts.view'), asyncRoute(async (req, res) => 
       id: `sale-${sale.id}`, loan_id: null, loan_type: 'sale', sale_number: sale.sale_number,
       description: `Mauzo ${sale.sale_number}`, borrower_name: sale.borrower_name || '—',
       borrower_phone: sale.borrower_phone, loan_date: sale.sale_date, principal: sale.total_amount,
-      paid_amount: sale.paid_amount, balance: sale.balance, due_date: sale.due_date,
+      paid_amount: sale.paid_amount, balance: sale.balance, due_date: sale.due_date, items: sale.items,
       status: Number(sale.paid_amount) > 0 ? 'partial' : 'unpaid',
     })),
     ...loans.map((loan) => ({
@@ -1627,8 +1891,8 @@ business.post('/loans/:loan/repayments', permission('debts.create'), writeLimite
         [req.business!.id, `SALE-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${String((count?.count || 0)+1).padStart(5,'0')}`, body.payment_date, amount.toFixed(2), req.user!.id], client,
       )
       await client.query(
-        `INSERT INTO sale_items(business_id,sale_id,item_name,quantity,unit_price,line_total,created_at,updated_at)
-         VALUES($1,$2,'Loan repayment','1.000',$3,$3,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+        `INSERT INTO sale_items(business_id,sale_id,item_name,quantity,unit,unit_price,line_total,created_at,updated_at)
+         VALUES($1,$2,'Loan repayment','1.000','amount',$3,$3,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
         [req.business!.id, sale!.id, amount.toFixed(2)],
       )
       await client.query(
@@ -1780,7 +2044,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (failure.code === '23514' || failure.code === '22P02' || failure.code === '22007' || failure.code === '22008') return fail(res, 422, 'The given data was invalid.')
   if (failure.status === 400) return fail(res, 400, 'The request body is not valid JSON.')
   if (failure.status) return fail(res, failure.status, failure.message)
-  console.error(failure)
+  logError(`api.unhandled ${_req.method} ${_req.baseUrl}${_req.route?.path || _req.path}`, error)
   return fail(res, 500, 'An unexpected server error occurred.')
 })
 

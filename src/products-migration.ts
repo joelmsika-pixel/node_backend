@@ -1,4 +1,6 @@
+import { readFile } from 'node:fs/promises'
 import { closeDatabase, rows, transaction } from './db.js'
+import { logError } from './safe-logger.js'
 
 const productPermissions = [
   'products.view',
@@ -8,61 +10,78 @@ const productPermissions = [
 ]
 
 async function migrateProducts(): Promise<void> {
+  const migrationSql = await readFile(
+    new URL('../migrations/20261113_products_and_images.sql', import.meta.url),
+    'utf8',
+  )
+  const cleanupMigrationSql = await readFile(
+    new URL('../migrations/20261116_persist_product_image_cleanup.sql', import.meta.url),
+    'utf8',
+  )
+  const saleItemsMigrationSql = await readFile(
+    new URL('../migrations/20261116_sale_items_product_id.sql', import.meta.url),
+    'utf8',
+  )
+  const productUnitsMigrationSql = await readFile(
+    new URL('../migrations/20261117_product_units.sql', import.meta.url),
+    'utf8',
+  )
+  const pcInspectionReportsMigrationSql = await readFile(
+    new URL('../migrations/20261118_pc_inspection_reports.sql', import.meta.url),
+    'utf8',
+  )
+
   await transaction(async (client) => {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS products (
-        id BIGSERIAL PRIMARY KEY,
-        business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
-        name VARCHAR(150) NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        selling_price NUMERIC(12,2) NOT NULL CHECK (selling_price >= 0),
-        cost_price NUMERIC(12,2) CHECK (cost_price IS NULL OR cost_price >= 0),
-        sku VARCHAR(100),
-        category VARCHAR(100) NOT NULL,
-        stock_quantity NUMERIC(12,3) NOT NULL DEFAULT 0 CHECK (stock_quantity >= 0),
-        created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        updated_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        deleted_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE (id, business_id)
-      );
-      CREATE INDEX IF NOT EXISTS products_business_created_idx
-        ON products(business_id, created_at DESC) WHERE deleted_at IS NULL;
-      CREATE INDEX IF NOT EXISTS products_business_category_idx
-        ON products(business_id, category) WHERE deleted_at IS NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS products_business_sku_unique_idx
-        ON products(business_id, lower(sku)) WHERE sku IS NOT NULL AND deleted_at IS NULL;
+    await client.query('SELECT pg_advisory_xact_lock($1)', [2026111301])
+    const existingColumns = await rows<{
+      table_name: string
+      column_name: string
+      data_type: string
+    }>(
+      `SELECT table_name,column_name,data_type
+       FROM information_schema.columns
+       WHERE table_schema=current_schema()
+         AND (table_name,column_name) IN (
+           ('businesses','id'),
+           ('users','id'),
+           ('business_user','business_id'),
+           ('business_user','user_id'),
+           ('business_user','role'),
+           ('business_user','permissions')
+         )`,
+      [],
+      client,
+    )
+    const columnTypes = new Map(
+      existingColumns.map((column) => [`${column.table_name}.${column.column_name}`, column.data_type]),
+    )
+    const requiredColumns = [
+      'businesses.id',
+      'users.id',
+      'business_user.business_id',
+      'business_user.user_id',
+      'business_user.role',
+      'business_user.permissions',
+    ]
+    const missingColumns = requiredColumns.filter((column) => !columnTypes.has(column))
+    if (missingColumns.length) {
+      throw new Error(`Product migration prerequisites are missing: ${missingColumns.join(', ')}.`)
+    }
 
-      CREATE TABLE IF NOT EXISTS product_images (
-        id BIGSERIAL PRIMARY KEY,
-        business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
-        product_id BIGINT NOT NULL,
-        image_key TEXT NOT NULL UNIQUE,
-        thumbnail_key TEXT NOT NULL UNIQUE,
-        width INTEGER NOT NULL CHECK (width > 0),
-        height INTEGER NOT NULL CHECK (height > 0),
-        size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
-        thumbnail_size_bytes INTEGER NOT NULL CHECK (thumbnail_size_bytes > 0),
-        sort_order SMALLINT NOT NULL DEFAULT 0,
-        deleted_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (product_id, business_id)
-          REFERENCES products(id, business_id) ON DELETE CASCADE
-      );
-      CREATE INDEX IF NOT EXISTS product_images_business_product_idx
-        ON product_images(business_id, product_id, sort_order) WHERE deleted_at IS NULL;
-      CREATE INDEX IF NOT EXISTS product_images_deleted_idx
-        ON product_images(business_id, deleted_at) WHERE deleted_at IS NOT NULL;
+    for (const column of ['businesses.id', 'users.id', 'business_user.business_id', 'business_user.user_id']) {
+      if (columnTypes.get(column) !== 'bigint') {
+        throw new Error(`Product migration requires ${column} to be bigint.`)
+      }
+    }
+    if (!['json', 'jsonb'].includes(columnTypes.get('business_user.permissions') || '')) {
+      throw new Error('Product migration requires business_user.permissions to be json or jsonb.')
+    }
 
-      CREATE TABLE IF NOT EXISTS product_image_cleanup (
-        object_key TEXT PRIMARY KEY,
-        business_id BIGINT NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE INDEX IF NOT EXISTS product_image_cleanup_business_idx
-        ON product_image_cleanup(business_id);
-    `)
+    await client.query(migrationSql)
+    await client.query(cleanupMigrationSql)
+    await client.query(saleItemsMigrationSql)
+    await client.query(productUnitsMigrationSql)
+    await client.query(pcInspectionReportsMigrationSql)
 
     const employees = await rows<{
       business_id: number
@@ -95,9 +114,9 @@ async function migrateProducts(): Promise<void> {
 
 try {
   await migrateProducts()
-  console.log('Product tables and employee permissions are ready.')
+  console.log('Product tables, PC inspection report history, and employee permissions are ready.')
 } catch (error) {
-  console.error('Product database migration failed:', error)
+  logError('products.migration', error)
   process.exitCode = 1
 } finally {
   await closeDatabase()

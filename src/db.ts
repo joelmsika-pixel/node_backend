@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import { normalizeDatabaseUrl } from './db-config.js'
 import pg, { type PoolClient, type QueryResultRow } from 'pg'
 import { Pool } from 'pg'
 
@@ -7,41 +8,14 @@ types.setTypeParser(20, (value) => Number(value))
 
 const databaseUrl = process.env.DATABASE_URL
 const isVercel = Boolean(process.env.VERCEL)
+const requireSsl = process.env.DB_SSL === 'true'
 if (isVercel && !databaseUrl) {
   throw new Error('DATABASE_URL must be configured for Vercel deployments.')
 }
-
-let connectionString = databaseUrl
-let urlSslMode: string | undefined
-if (databaseUrl) {
-  const parsedUrl = new URL(databaseUrl)
-  urlSslMode = parsedUrl.searchParams.get('sslmode')?.toLowerCase()
-
-  const unsupportedCertificateParameters = ['sslcert', 'sslkey', 'sslrootcert']
-    .filter((parameter) => parsedUrl.searchParams.has(parameter))
-  if (unsupportedCertificateParameters.length) {
-    throw new Error(
-      `DATABASE_URL certificate parameters are not supported (${unsupportedCertificateParameters.join(', ')}). `
-      + 'Use a provider URL that relies on the system certificate store.',
-    )
-  }
-
-  const supportedSslModes = new Set(['disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full'])
-  if (urlSslMode && !supportedSslModes.has(urlSslMode)) {
-    throw new Error(`DATABASE_URL contains an unsupported sslmode: ${urlSslMode}.`)
-  }
-  if (isVercel && ['disable', 'allow'].includes(urlSslMode || '')) {
-    throw new Error('DATABASE_URL must require TLS for Vercel deployments.')
-  }
-
-  parsedUrl.searchParams.delete('sslmode')
-  connectionString = parsedUrl.toString()
-}
-
-const requireTls = isVercel
-  || process.env.DB_SSL === 'true'
-  || (urlSslMode !== undefined && urlSslMode !== 'disable')
-const ssl = requireTls ? { rejectUnauthorized: true } : undefined
+const connectionString = databaseUrl
+  ? normalizeDatabaseUrl(databaseUrl, { vercel: isVercel, requireSsl })
+  : undefined
+const ssl = !connectionString && requireSsl ? { rejectUnauthorized: true } : undefined
 
 const pool = new Pool({
   ...(connectionString
@@ -54,7 +28,7 @@ const pool = new Pool({
         password: process.env.DB_PASSWORD || '',
       }),
   ...(ssl ? { ssl } : {}),
-  max: Number(process.env.DB_POOL_SIZE || (isVercel ? 3 : 10)),
+  max: Number(process.env.DB_POOL_SIZE || (process.env.VERCEL ? 3 : 10)),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
 })

@@ -45,30 +45,40 @@ authorized by the existing owner rule. The product migration adds these four
 permissions to current employee memberships; newly created employees receive
 them by default.
 
+PC inspection reports are business-scoped at
+`/api/businesses/{business}/pc-inspection-reports`. Owners and employees with
+product access can create a batch with `POST`, list saved report history with
+`GET`, and retrieve an individual report with `GET /:report` for PDF download.
+Each report snapshots the business and preparer names and stores its PC
+inspection details.
+
 After confirming that the target PostgreSQL database has the existing
-`businesses`, `users`, and `business_user` tables, take a backup and run the
-product migration explicitly from this directory:
+`businesses`, `users`, and `business_user` tables, review their ID and
+permissions column types and take a verified backup. The migration checks
+these prerequisites and runs product DDL and employee-permission updates in
+one transaction. It creates the `products`, `product_images`,
+`product_image_cleanup`, and `pc_inspection_reports` objects as needed, and
+adds product and sale-item unit columns. Existing records receive the legacy
+default unit `pieces`. It does not drop application tables. Run it explicitly
+from this directory against
+the intended database:
 
 ```sh
 npm run db:migrate-products
 ```
 
-This creates the product, product-image, and image-cleanup tables. Like
-`db:init`, it is not run at API startup or during deployment. Do not run it
-against production until the database target and backup have been verified.
-Before running it against production, verify the live database/schema and the
-`id` columns on `businesses` and `users`, plus `business_id`, `user_id`,
-`role`, and `permissions` on `business_user`. The migration's only other
-existing-table dependency is `businesses` / `users` ownership and creator
-foreign keys. It creates `products`, `product_images`, and
-`product_image_cleanup` with `IF NOT EXISTS`; it does not drop tables or delete
-product records. It also adds the four product permissions to employee
-memberships so the existing product routes can be used. Re-running it does
-not duplicate those permissions.
-
-Run the command only from a trusted environment whose `DATABASE_URL` is
-confirmed to point at the intended Vercel PostgreSQL database. The command
-does not run as part of the Vercel build or deployment.
+The reviewed SQL is also available at
+[`migrations/20261113_products_and_images.sql`](./migrations/20261113_products_and_images.sql).
+Unit support is added by
+[`migrations/20261117_product_units.sql`](./migrations/20261117_product_units.sql).
+PC report history is added by
+[`migrations/20261118_pc_inspection_reports.sql`](./migrations/20261118_pc_inspection_reports.sql).
+This command is not run at startup, during build, or during deployment. For
+production, run it from a trusted environment configured with the production
+database URL only after verifying the URL target and backup. Confirm that it
+reports success before deploying product-enabled API code. The DDL is
+idempotent for absent tables/indexes; the migration fails before DDL if base
+table prerequisites do not match.
 
 Configure these backend environment variables before uploading images:
 
@@ -127,8 +137,9 @@ build.
 
 In Vercel:
 
-1. Import this repository from GitHub and use the repository root as the
-   project root. Select the Express framework preset (or accept detection).
+1. Import this repository from GitHub and set the Vercel project Root
+   Directory to `node_backend`. Select the Express framework preset (or accept
+   detection).
 2. Leave the Output Directory unset. Use `npm install` and `npm run build` for
    install and build commands.
 3. Add the environment variables below for Production, and for Preview if
@@ -151,22 +162,28 @@ Required Vercel variables:
   provider's pooled URL.
 - `FRONTEND_URLS` — comma-separated, exact browser origins including scheme,
   such as `https://app.example.com`. Set all allowed origins.
+- Ensure the database URL hostname matches its TLS certificate. Legacy
+  `sslmode=prefer`, `sslmode=require`, and `sslmode=verify-ca` are normalized
+  to `sslmode=verify-full`; `sslmode=no-verify` is rejected. Do not disable
+  certificate verification.
 
 Optional variables:
 
 - `DB_POOL_SIZE` — per-instance `pg` pool size; defaults to `3` on Vercel and
   `10` locally. Keep this modest and use the provider's pooled URL.
-- `DB_SSL=true` — explicitly require certificate-validated TLS outside Vercel.
-  Vercel always requires TLS with certificate verification. A PostgreSQL URL's
-  `sslmode` is normalized to the corresponding strict TLS configuration to
-  avoid node-postgres SSL-mode compatibility warnings; `sslmode=disable` and
-  `sslmode=allow` are rejected on Vercel.
-- `TRUST_PROXY=true` — only for a non-Vercel deployment known to have exactly
-  one trusted proxy. Vercel automatically trusts one platform proxy hop; do
-  not set a broader proxy trust value.
+- `DB_SSL=true` — explicitly require certificate-validated TLS for a
+  non-Vercel connection URL.
+- `TRUST_PROXY=true` — only for a trusted single-proxy non-Vercel deployment.
+  Vercel automatically trusts one proxy hop. Do not configure trust for all
+  proxies. All rate limiters use the trusted Express client IP and ignore
+  caller-supplied `Forwarded` values and bearer tokens as rate-limit keys.
 - `BUSINESS_CURRENCIES`, `ACCESS_TOKEN_EXPIRATION_MINUTES`, and
   `REFRESH_TOKEN_EXPIRATION_DAYS` — API defaults are documented in
   `.env.example`.
+- Sessions expire after 12 hours without user activity. Authenticated API
+  requests and `POST /api/session/activity` extend the refresh-token idle
+  expiration. Access tokens keep their configured lifetime, and refresh tokens
+  retain their configured maximum lifetime.
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, and
   `SMTP_FROM` — configure these to enable password reset emails. Legacy `MAIL_*`
   aliases are also accepted by the application.
@@ -176,6 +193,40 @@ then `GET https://<deployment-domain>/api/health` for database connectivity.
 The health endpoint must return a connected database status. Test login and
 other authenticated routes using a valid account and bearer token, and verify
 password reset only after SMTP is configured.
+
+### Product and deployment verification checklist
+
+After running the explicit product migration and deploying:
+
+1. `GET /` returns API metadata and `GET /api/health` reports a connected
+   database.
+2. `POST /api/login` with a test account returns a token pair;
+   `POST /api/token/refresh` with that test refresh token rotates the pair;
+   `GET /api/me` with the access token returns the user and businesses.
+3. `GET /api/businesses/{business}/products` returns a paginated product list
+   for a member with `products.view`. Verify an unrelated business ID remains
+   inaccessible and users without permission remain forbidden.
+4. With a disposable product and configured test R2 bucket, create it with an
+   image, replace/remove an image, and delete the product. Confirm successful
+   R2 cleanup removes soft-deleted image rows; temporarily deny R2 deletion in
+   staging and confirm cleanup rows remain for retry.
+5. In staging, verify rate-limit headers and per-client limits; confirm Vercel
+   logs no `ERR_ERL_FORWARDED_HEADER` or `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR`.
+   Do not load-test production.
+6. Confirm Vercel runtime logs have no PostgreSQL SSL-mode compatibility
+   warning and that the provider accepts the verified TLS connection.
+7. Recheck business, customer, sales, expense, and loan list/read endpoints
+   using existing test records.
+
+Do not use production account tokens or real customer records for this test
+plan. The repository build and automated tests do not have access to Vercel's
+environment or production PostgreSQL/R2 services; those checks must be
+performed after the reviewed migration and deployment.
+
+Unexpected API failures return a generic error response and write a structured
+`api.unhandled` entry with a redacted stack trace to the deployment runtime
+logs. Use those logs to diagnose production failures; do not include request
+headers, tokens, or environment values when sharing log excerpts.
 
 ## API outline
 
